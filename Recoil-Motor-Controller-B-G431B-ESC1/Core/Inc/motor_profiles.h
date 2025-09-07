@@ -3,6 +3,7 @@
  *
  *  Created on: Sep 5, 2023
  *      Author: tk
+ *      Revise：csx
  */
 
 #ifndef INC_MOTOR_PROFILES_H_
@@ -15,11 +16,21 @@
 
 #ifdef MOTORPROFILE_MAD_M6C12_150KV
 #define MOTOR_POLE_PAIRS                      14
+#define MOTOR_TORQUE_CONSTANT                 0.08958f
+#define MOTOR_PHASE_RESISTANCE                0.1379327499999995f
+#define MOTOR_PHASE_INDUCTANCE                3.039166666666666668e-05f
+#define MOTOR_CALIBRATION_CURRENT             5
+#endif
+
+/*
+#ifdef MOTORPROFILE_MAD_M6C12_150KV
+#define MOTOR_POLE_PAIRS                      14
 #define MOTOR_TORQUE_CONSTANT                 0.0919f
 #define MOTOR_PHASE_RESISTANCE                0.1886f
 #define MOTOR_PHASE_INDUCTANCE                0.0000325f
 #define MOTOR_CALIBRATION_CURRENT             5
 #endif
+*/
 
 #ifdef MOTORPROFILE_MAD_5010_110KV
 #define MOTOR_POLE_PAIRS                      14
@@ -43,6 +54,14 @@
 #define MOTOR_PHASE_RESISTANCE                0.03000304860153151f
 #define MOTOR_PHASE_INDUCTANCE                1.0717319302328058e-05f
 #define MOTOR_CALIBRATION_CURRENT             5
+#endif
+
+#ifdef MOTORPROFILE_MAD_5010_200KV
+#define MOTOR_POLE_PAIRS                      14
+#define MOTOR_TORQUE_CONSTANT                 0.06588f
+#define MOTOR_PHASE_RESISTANCE                0.1522674999995f
+#define MOTOR_PHASE_INDUCTANCE                2.649166666666666668e-05f
+#define MOTOR_CALIBRATION_CURRENT             3
 #endif
 
 
