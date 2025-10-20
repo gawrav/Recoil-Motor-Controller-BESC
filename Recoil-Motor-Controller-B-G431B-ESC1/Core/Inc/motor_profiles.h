@@ -40,6 +40,14 @@
 #define MOTOR_CALIBRATION_CURRENT             3
 #endif
 
+#ifdef MOTORPROFILE_MAD_5010_140KV
+#define MOTOR_POLE_PAIRS                      14
+#define MOTOR_TORQUE_CONSTANT                 0.0913f
+#define MOTOR_PHASE_RESISTANCE                0.3939f
+#define MOTOR_PHASE_INDUCTANCE                0.0000433f
+#define MOTOR_CALIBRATION_CURRENT             3
+#endif
+
 #ifdef MOTORPROFILE_MAD_5010_310KV
 #define MOTOR_POLE_PAIRS                      14
 //#define MOTOR_TORQUE_CONSTANT                 370
