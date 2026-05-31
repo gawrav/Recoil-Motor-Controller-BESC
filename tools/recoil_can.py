@@ -17,13 +17,19 @@ Protocol (from the firmware, see motor_controller.c / motor_controller_conf.h):
 "Param offset" is the byte offset of the field inside the MotorController struct;
 the firmware reads/writes 32 bits at that offset directly.
 
-ADAPTER: defaults to an slcan device (CANable/CANtact-style) which is the most
-Mac-friendly. Override with --interface / --channel / --bitrate. Examples:
-  slcan:   --interface slcan   --channel /dev/tty.usbmodem1234   (default)
-  pcan:    --interface pcan     --channel PCAN_USBBUS1
-  socketcan (Linux): --interface socketcan --channel can0
+ADAPTER:
+  CANable / CANtact running candleLight firmware  -> gs_usb (raw USB, NO /dev/tty).
+    macOS:  brew install libusb && pip install python-can gs_usb pyusb
+    run:    --interface gs_usb --channel 0      (channel = scan index; 0 = first device)
+  CANable / CANtact running slcan firmware        -> shows up as /dev/tty.usbmodem*.
+    run:    --interface slcan --channel /dev/tty.usbmodem1234   (default)
+  pcan:               --interface pcan       --channel PCAN_USBBUS1
+  socketcan (Linux):  --interface socketcan  --channel can0
 
-Requires:  pip install python-can
+If `ioreg`/System Information shows "canable gs_usb" and there is NO /dev/tty.usb*
+node, your dongle has candleLight firmware -> use --interface gs_usb.
+
+Requires:  pip install python-can   (+ gs_usb pyusb and libusb for the gs_usb backend)
 """
 
 import argparse
@@ -223,10 +229,27 @@ def cmd_monitor(dev, period):
         print("\nstopped.")
 
 
+def open_bus(interface, channel, bitrate):
+    """Open a python-can bus, handling the gs_usb backend's index-based addressing.
+
+    gs_usb (candleLight) has no /dev node — the device is selected by scan index,
+    and the bitrate is programmed onto the dongle here.
+    """
+    if interface == "gs_usb":
+        idx = int(channel) if str(channel).isdigit() else 0
+        # Pass both channel and index: depending on python-can version one or the
+        # other selects the scanned device; the unused one is ignored.
+        return can.Bus(interface="gs_usb", channel=idx, index=idx, bitrate=bitrate)
+    return can.Bus(interface=interface, channel=channel, bitrate=bitrate)
+
+
 def main():
     p = argparse.ArgumentParser(description="Recoil ESC CAN control")
-    p.add_argument("--interface", default="slcan")
-    p.add_argument("--channel", default="/dev/tty.usbmodem1101")
+    # Default to gs_usb (candleLight CANable). For an slcan dongle use:
+    #   --interface slcan --channel /dev/tty.usbmodemXXXX
+    p.add_argument("--interface", default="gs_usb")
+    p.add_argument("--channel", default="0",
+                   help="gs_usb: scan index (0=first); slcan: /dev/tty.usbmodemXXXX")
     p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE)
     p.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -255,7 +278,7 @@ def main():
 
     args = p.parse_args()
 
-    bus = can.Bus(interface=args.interface, channel=args.channel, bitrate=args.bitrate)
+    bus = open_bus(args.interface, args.channel, args.bitrate)
     dev = RecoilCAN(bus, device_id=args.device_id)
     try:
         if args.cmd == "status":
