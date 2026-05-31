@@ -78,9 +78,13 @@
 // motor's increases. The vernier math requires the secondary angle to increase in the SAME
 // sense as (15/16)*motor, so we negate it in software by default. Set to +1 if the secondary's
 // DIR pin / magnet polarity already compensates the mesh inversion in hardware.
-// A wrong choice here makes calibration's frac(x) spread (or boot psi_error) blow up → fails
-// closed, so it's safe to flip and re-test.
-#define VERNIER_SECONDARY_SIGN          (-1)
+// Determined empirically on this rig: with the secondary read raw (no sign), enc2 tracks the
+// primary in the SAME direction at ~15/16 rate (bench monitor, hand-rotate), so no inversion is
+// needed. (The spur pair counter-rotates mechanically, but magnet/DIR orientation nets to
+// forward-reading.) A wrong choice mis-scales delta to (31/16)*alpha — calibration can falsely
+// pass at the home position yet mis-resolve the sector at other positions, so verify by checking
+// boot resolution succeeds across the full range, not just at home.
+#define VERNIER_SECONDARY_SIGN          (+1)
 
 /** ======== Motor Selection ======== **/
 
