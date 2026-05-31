@@ -66,6 +66,22 @@
 #define ENCODER_DIRECTION               +1
 #define ENCODER_PRECISION_BITS          12
 
+/** ======== Secondary AS5600L vernier encoder ======== **/
+// Encoder gear pair: 15-tooth on motor shaft drives 16-tooth on secondary shaft.
+// Secondary shaft rate = NUM/DEN of motor = 15/16. Pattern repeats every 16 motor revs.
+#define VERNIER_SECTORS                 16            // = larger tooth count (sectors before repeat)
+#define VERNIER_SECONDARY_NUM           15            // 15T driver
+#define VERNIER_SECONDARY_DEN           16            // 16T driven
+// (The 15:1 cycloidal gearbox ratio is position_controller.gear_ratio — unrelated to these.)
+//
+// The 15T/16T external mesh REVERSES rotation, so the secondary's raw angle decreases as the
+// motor's increases. The vernier math requires the secondary angle to increase in the SAME
+// sense as (15/16)*motor, so we negate it in software by default. Set to +1 if the secondary's
+// DIR pin / magnet polarity already compensates the mesh inversion in hardware.
+// A wrong choice here makes calibration's frac(x) spread (or boot psi_error) blow up → fails
+// closed, so it's safe to flip and re-test.
+#define VERNIER_SECONDARY_SIGN          (-1)
+
 /** ======== Motor Selection ======== **/
 
 #define MOTORPROFILE_MAD_M6C12_150KV
@@ -121,6 +137,7 @@ typedef enum {
   // these are special modes
   MODE_DAMPING                    = 0x02U,  // stopped
   MODE_CALIBRATION                = 0x05U,
+  MODE_VERNIER_CALIBRATION        = 0x06U,  // static, non-driving vernier calibration
 
   // these are closed-loop modes
   MODE_CURRENT                    = 0x10U,
@@ -155,6 +172,8 @@ typedef enum {
   ERROR_CAN_TX_FAULT              = 0b0000100000000000U,
   ERROR_I2C_FAULT                 = 0b0001000000000000U,
   ERROR_ENCODER_FAULT             = 0b0010000000000000U,
+  ERROR_VERNIER_INCONSISTENT      = 0b0100000000000000U,  // boot sector cross-check failed / uncalibrated
+  ERROR_VERNIER_CALIBRATION_FAILED= 0b1000000000000000U,  // vernier calibration could not complete
 } ErrorCode;
 
 /** ======== CAN Packet Definitions ======== **/
@@ -262,6 +281,13 @@ typedef enum {
   PARAM_ENCODER_VELOCITY                                = 0x138U,
   PARAM_ENCODER_FLUX_OFFSET                             = 0x13CU,
   PARAM_ENCODER_FLUX_OFFSET_TABLE                       = 0x140U,
+  // ===== Secondary vernier encoder + state (appended; offsets verified via static_assert in motor_controller.c) =====
+  // encoder_secondary begins right after the primary encoder's flux_offset_table[128]:
+  // 0x140 + 128*4 = 0x340.
+  PARAM_ENCODER_SECONDARY_POSITION                      = 0x360U,  // secondary accumulated position (telemetry)
+  PARAM_VERNIER_PHASE_OFFSET                            = 0x56CU,  // calibrated magnet fingerprint (read-only)
+  PARAM_VERNIER_BASE_SECTOR                             = 0x570U,  // calibrated sector origin (read-only)
+  PARAM_VERNIER_SECTOR                                  = 0x571U,  // live resolved sector (read-only)
 } Parameter;
 
 

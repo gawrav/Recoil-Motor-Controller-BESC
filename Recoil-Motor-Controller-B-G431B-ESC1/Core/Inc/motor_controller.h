@@ -44,6 +44,16 @@ typedef struct {
   PowerStage          powerstage;
   Motor               motor;
   Encoder             encoder;
+
+  // ===== Secondary AS5600L vernier encoder (appended at END to preserve existing PARAM offsets) =====
+  Encoder             encoder_secondary;
+  float               vernier_phase_offset;     // calibrated magnet fingerprint (rad), persisted
+  uint8_t             vernier_base_sector;      // calibrated sector renumbering origin (0..15), persisted
+  uint8_t             vernier_sector;           // live resolved sector (NOT persisted)
+  uint8_t             vernier_initialized;      // live boolean (NOT persisted)
+  uint8_t             UNUSED_vernier_pad;       // alignment pad
+  uint16_t            vernier_sanity_counter;   // deferred runtime sanity check (Phase 2)
+  uint16_t            UNUSED_vernier_pad2;      // alignment pad
 } MotorController;
 
 /**
@@ -106,6 +116,21 @@ void MotorController_update(MotorController *controller);
 void MotorController_updateService(MotorController *controller);
 
 void MotorController_runCalibrationSequence(MotorController *controller);
+
+/**
+ * Resolve absolute motor position at boot from the vernier (primary + secondary encoders).
+ * Runs with the TIM1 update interrupt masked. Seeds encoder.n_rotations from the stored
+ * calibration constants. Fails closed (HAL_ERROR + ERROR_VERNIER_INCONSISTENT) if the sector
+ * cross-check fails or the unit is uncalibrated.
+ */
+HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *controller);
+
+/**
+ * Static (non-driving) vernier calibration. Computes vernier_phase_offset (magnet fingerprint)
+ * and vernier_base_sector + position_controller.position_offset (operator-placed home), then
+ * persists to Flash. The motor is never energized.
+ */
+void MotorController_runVernierCalibration(MotorController *controller);
 
 void MotorController_handleCANMessage(MotorController *controller, CAN_Frame *rx_frame);
 

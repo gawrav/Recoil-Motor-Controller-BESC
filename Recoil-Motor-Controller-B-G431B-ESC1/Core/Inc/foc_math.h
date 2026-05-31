@@ -26,6 +26,8 @@
 #define M_PI_2_F      1.5707963267948966f
 #define M_PI_4_F      0.7853981633974483f
 
+#define deg2rad(d)    ((d) * (M_PI_F / 180.0f))
+
 #define Q31_TO_FLOAT(x)                       ((float)(x) / (float)(0x80000000))
 #define FLOAT_TO_Q31(x)                       ((int32_t)((float)(x) * (float)0x7FFFFFFF))
 
@@ -60,6 +62,18 @@ static inline float clampf(float value, float min, float max) {
 static inline float wrapTo2Pi(float value) {
   value = fmodf(value, M_2PI_F);
   return value >= 0.f ? value : (value + M_2PI_F);
+}
+
+/**
+ * Wrap a floating-point value to the signed range [-π, π).
+ *
+ * @param value - The input floating-point value to be wrapped.
+ *
+ * @return The wrapped value within the range [-π, π).
+ */
+static inline float wrapToPi(float value) {
+  value = wrapTo2Pi(value);
+  return value >= M_PI_F ? (value - M_2PI_F) : value;
 }
 
 static inline float fast_fmaxf(float a, float b) {

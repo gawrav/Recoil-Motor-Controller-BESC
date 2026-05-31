@@ -8,9 +8,9 @@
 #include "encoder.h"
 
 
-HAL_StatusTypeDef Encoder_init(Encoder *encoder, I2C_HandleTypeDef *hi2c) {
+HAL_StatusTypeDef Encoder_init(Encoder *encoder, I2C_HandleTypeDef *hi2c, uint16_t i2c_address, uint8_t init_bus) {
   encoder->hi2c = hi2c;
-//  encoder->i2c_update_counter = 0;
+  encoder->i2c_address = i2c_address << 1;  // store already-shifted 7-bit address
 
   encoder->cpr = ENCODER_DIRECTION * (1 << ENCODER_PRECISION_BITS);  // 12 bit precision
 
@@ -27,14 +27,17 @@ HAL_StatusTypeDef Encoder_init(Encoder *encoder, I2C_HandleTypeDef *hi2c) {
 
   Encoder_resetFluxOffset(encoder);
 
+  // Bounded probe so a missing/dead device fails gracefully instead of hanging boot.
+  // init_bus: only the first (primary) encoder initializes the shared I2C peripheral.
   HAL_StatusTypeDef status = HAL_ERROR;
-  while (status) {
-    HAL_I2C_Init(encoder->hi2c);
-
+  for (uint8_t attempt = 0; attempt < 10 && status != HAL_OK; attempt += 1) {
+    if (init_bus) {
+      HAL_I2C_Init(encoder->hi2c);
+    }
     // wait for I2C device to power up
     HAL_Delay(100);
 
-    status = HAL_I2C_Mem_Read(encoder->hi2c, AS5600_I2C_ADDR << 1, AS5600_ANGLE_ADDR, I2C_MEMADD_SIZE_8BIT, encoder->i2c_buffer, 2, 100);
+    status = HAL_I2C_Mem_Read(encoder->hi2c, encoder->i2c_address, AS5600_ANGLE_ADDR, I2C_MEMADD_SIZE_8BIT, encoder->i2c_buffer, 2, 100);
   }
 
   return status;
@@ -59,7 +62,7 @@ HAL_StatusTypeDef Encoder_update(Encoder *encoder) {
   // TODO: implement encoder lut-table Linearization
 
   // I2C takes ~77.75 us (12.86 kHz) to finish one transaction
-  HAL_I2C_Master_Receive_IT(encoder->hi2c, AS5600_I2C_ADDR << 1, encoder->i2c_buffer, 2);
+  HAL_I2C_Master_Receive_IT(encoder->hi2c, encoder->i2c_address, encoder->i2c_buffer, 2);
 
 
   // Calculate the change in reading

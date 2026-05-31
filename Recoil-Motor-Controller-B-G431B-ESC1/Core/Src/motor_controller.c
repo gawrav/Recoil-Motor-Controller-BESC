@@ -6,7 +6,26 @@
  */
 
 #include "motor_controller.h"
+#include <stddef.h>
+#include <assert.h>
 
+// Verify the hand-coded PARAM byte offsets match the actual struct layout (Level 0.3).
+// A mismatch here means SDO/Flash access would touch the wrong field — fail the build instead.
+_Static_assert(offsetof(MotorController, encoder_secondary) == 0x340,
+               "encoder_secondary offset shifted - PARAM offsets stale");
+_Static_assert(offsetof(MotorController, encoder_secondary.position) == PARAM_ENCODER_SECONDARY_POSITION,
+               "PARAM_ENCODER_SECONDARY_POSITION mismatch");
+_Static_assert(offsetof(MotorController, vernier_phase_offset) == PARAM_VERNIER_PHASE_OFFSET,
+               "PARAM_VERNIER_PHASE_OFFSET mismatch");
+_Static_assert(offsetof(MotorController, vernier_base_sector) == PARAM_VERNIER_BASE_SECTOR,
+               "PARAM_VERNIER_BASE_SECTOR mismatch");
+_Static_assert(offsetof(MotorController, vernier_sector) == PARAM_VERNIER_SECTOR,
+               "PARAM_VERNIER_SECTOR mismatch");
+_Static_assert(sizeof(MotorController) <= FLASH_PAGE_SIZE,
+               "MotorController no longer fits in one Flash page");
+// Existing primary encoder offset must not have shifted (regression guard for review M-4):
+_Static_assert(offsetof(MotorController, encoder.position_offset) == PARAM_ENCODER_POSITION_OFFSET,
+               "primary PARAM offsets shifted - existing CAN/Flash access broken");
 
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
@@ -33,6 +52,14 @@ void MotorController_init(MotorController *controller) {
   controller->device_id = DEVICE_CAN_ID;
   controller->firmware_version = FIRMWARE_VERSION;
 
+  // Vernier state defaults. phase_offset = NaN marks "uncalibrated" until loadConfig restores a
+  // valid value or MODE_VERNIER_CALIBRATION writes one. Live fields are not persisted.
+  controller->vernier_phase_offset = NAN;
+  controller->vernier_base_sector  = 0;
+  controller->vernier_sector       = 0;
+  controller->vernier_initialized  = 0;
+  controller->vernier_sanity_counter = 0;
+
   HAL_StatusTypeDef status = HAL_OK;
   uint32_t init_error_step = 0;
 
@@ -40,8 +67,12 @@ void MotorController_init(MotorController *controller) {
   status |= CAN_init(&hfdcan1, 0, 0);
   if (status && !init_error_step) init_error_step = 1;
 
-  status |= Encoder_init(&controller->encoder, &hi2c1);
+  status |= Encoder_init(&controller->encoder, &hi2c1, AS5600_I2C_ADDR, 1);  // primary: init the shared bus
   if (status && !init_error_step) init_error_step = 2;
+  // Secondary AS5600L on the SAME bus (init_bus=0, don't re-init the peripheral). A missing/dead
+  // secondary must NOT trigger the hard init-error loop — keep its status out of `status` so boot
+  // proceeds and vernier resolution fails closed (MODE_DISABLED) instead.
+  (void)Encoder_init(&controller->encoder_secondary, &hi2c1, AS5600L_I2C_ADDR_SECONDARY, 0);
   status |= PowerStage_init(&controller->powerstage, &htim1, &hadc1, &hadc2);
   if (status && !init_error_step) init_error_step = 3;
   status |= Motor_init(&controller->motor);
@@ -112,9 +143,102 @@ void MotorController_init(MotorController *controller) {
   HAL_Delay(100);
   PowerStage_calibratePhaseCurrentOffset(&controller->powerstage);
 
-  // change mode to idle
+  // clear init-phase errors before resolving (so a resolution error survives — review pass 3)
   MotorController_clearError(controller);
-  MotorController_setMode(controller, MODE_IDLE);
+
+  // Resolve absolute arm position from the vernier. Fail closed: only go operational (MODE_IDLE)
+  // if resolution succeeds; otherwise stay MODE_DISABLED with the error set, requiring either a
+  // fix or MODE_VERNIER_CALIBRATION. (The unconditional setMode(MODE_IDLE) is now guarded.)
+  if (MotorController_resolveAbsolutePosition(controller) == HAL_OK) {
+    MotorController_setMode(controller, MODE_IDLE);
+  }
+  // else: ERROR_VERNIER_INCONSISTENT / ERROR_VERNIER_CALIBRATION_FAILED already set; remain MODE_DISABLED.
+}
+
+// Drain any in-flight interrupt-driven I2C receive so a subsequent blocking read won't get HAL_BUSY.
+// Returns HAL_OK if the bus is ready, HAL_ERROR if it stays stuck. Call with TIM1 IT already masked.
+static HAL_StatusTypeDef MotorController_drainI2C(void) {
+  uint32_t t0 = HAL_GetTick();
+  while (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY && (HAL_GetTick() - t0) < 5) { }
+  if (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY) {
+    HAL_I2C_Master_Abort_IT(&hi2c1, AS5600_I2C_ADDR << 1);   // in-flight device is always the primary
+    t0 = HAL_GetTick();
+    while (HAL_I2C_GetState(&hi2c1) != HAL_I2C_STATE_READY && (HAL_GetTick() - t0) < 5) { }
+  }
+  return (HAL_I2C_GetState(&hi2c1) == HAL_I2C_STATE_READY) ? HAL_OK : HAL_ERROR;
+}
+
+// Blocking-read one encoder's 12-bit ANGLE register into *raw. Bus must be owned (TIM1 masked + drained).
+static HAL_StatusTypeDef MotorController_readEncoderRaw(Encoder *encoder, uint16_t *raw) {
+  uint8_t buf[2];
+  HAL_StatusTypeDef s = HAL_I2C_Mem_Read(&hi2c1, encoder->i2c_address, AS5600_ANGLE_ADDR,
+                                         I2C_MEMADD_SIZE_8BIT, buf, 2, 10);
+  *raw = (((uint16_t)buf[0]) << 8) | buf[1];
+  if (s != HAL_OK || *raw >= (1U << ENCODER_PRECISION_BITS)) {
+    return HAL_ERROR;
+  }
+  return HAL_OK;
+}
+
+// Convert a raw secondary reading to the vernier-consistent angle (compensating the 15T/16T mesh
+// rotation reversal via VERNIER_SECONDARY_SIGN). Result wrapped to [0, 2pi).
+static inline float MotorController_secondaryAngle(uint16_t raw_s, int32_t cpr) {
+  float a = ((float)raw_s / (float)cpr) * M_2PI_F;
+  return wrapTo2Pi((float)VERNIER_SECONDARY_SIGN * a);
+}
+
+HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *controller) {
+  // Uncalibrated unit (no valid magnet fingerprint) → fail closed; requires MODE_VERNIER_CALIBRATION.
+  if (isnan(controller->vernier_phase_offset)) {
+    SET_BITS(controller->error, ERROR_VERNIER_CALIBRATION_FAILED);
+    return HAL_ERROR;
+  }
+
+  // The 10 kHz TIM1 ISR is already live (PowerStage_start). Mask it so blocking reads + the seed
+  // can't be preempted/raced. Then drain any in-flight IT receive (review C-1).
+  __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+
+  uint16_t theta_p_raw = 0, theta_s_raw = 0;
+  HAL_StatusTypeDef status = MotorController_drainI2C();
+  if (status == HAL_OK) status = MotorController_readEncoderRaw(&controller->encoder, &theta_p_raw);
+  if (status == HAL_OK) status = MotorController_readEncoderRaw(&controller->encoder_secondary, &theta_s_raw);
+
+  if (status != HAL_OK) {
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+    SET_BITS(controller->error, ERROR_VERNIER_INCONSISTENT);
+    return HAL_ERROR;
+  }
+
+  float theta_p = wrapTo2Pi(((float)theta_p_raw / (float)controller->encoder.cpr) * M_2PI_F);
+  float theta_s = MotorController_secondaryAngle(theta_s_raw, controller->encoder_secondary.cpr);
+
+  // Sector resolution (see vernier math): psi = wrapTo2Pi(delta - theta_p/N - phase_offset).
+  float delta = wrapTo2Pi(theta_p - theta_s);
+  float psi   = wrapTo2Pi(delta - theta_p / (float)VERNIER_SECTORS - controller->vernier_phase_offset);
+  int32_t q_raw = lroundf(psi * (float)VERNIER_SECTORS / M_2PI_F);
+  q_raw = ((q_raw % VERNIER_SECTORS) + VERNIER_SECTORS) % VERNIER_SECTORS;
+
+  // Consistency check: residual to the nearest sector centre must be small, else fail closed.
+  float psi_expected = (float)q_raw * (M_2PI_F / (float)VERNIER_SECTORS);
+  if (fabsf(wrapToPi(psi - psi_expected)) > deg2rad(5.0f)) {
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+    SET_BITS(controller->error, ERROR_VERNIER_INCONSISTENT);
+    return HAL_ERROR;
+  }
+
+  // Renumber so the supercycle wrap sits outside the arm's travel (vernier_base_sector).
+  int32_t n_rot = (q_raw - (int32_t)controller->vernier_base_sector + VERNIER_SECTORS) % VERNIER_SECTORS;
+
+  // Seed atomically (review M1): position_raw consistent with n_rotations + position, so the next
+  // Encoder_update's multi-turn crossing logic (encoder.c) doesn't spuriously bump n_rotations.
+  controller->encoder.position_raw = theta_p_raw;
+  controller->encoder.n_rotations  = n_rot;
+  controller->encoder.position     = theta_p + (float)n_rot * M_2PI_F;
+  controller->vernier_sector       = (uint8_t)q_raw;
+  controller->vernier_initialized  = 1;
+
+  __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+  return HAL_OK;
 }
 
 void MotorController_reset(MotorController *controller) {
@@ -156,6 +280,15 @@ void MotorController_setMode(MotorController *controller, Mode mode) {
       __HAL_TIM_SET_COUNTER(&htim3, 0);
       MotorController_reset(controller);
       PowerStage_enablePWM(&controller->powerstage);
+      break;
+
+    case MODE_VERNIER_CALIBRATION:
+      // Safe, NON-DRIVING mode (static reads only) — modeled on MODE_IDLE: set the LED but do
+      // NOT enable PWM. PowerStage_disablePWM was already called at the top of setMode, so the
+      // motor stays de-energized. A distinct LED rate marks vernier calibration.
+      __HAL_TIM_SET_AUTORELOAD(&htim3, 1999);
+      __HAL_TIM_SET_COMPARE(&htim3, TIM_CHANNEL_1, __HAL_TIM_GET_AUTORELOAD(&htim3) / 8);
+      __HAL_TIM_SET_COUNTER(&htim3, 0);
       break;
 
     case MODE_DAMPING:
@@ -277,6 +410,14 @@ HAL_StatusTypeDef MotorController_loadConfig(MotorController *controller) {
     controller->encoder.position_offset                         = controller_config->encoder.position_offset;
     if (isnan(controller_config->encoder.position_offset))                   return HAL_ERROR;
     controller->encoder.velocity_filter_alpha                   = controller_config->encoder.velocity_filter_alpha;
+
+    // Secondary vernier calibration. NaN phase_offset means "uncalibrated": do NOT return HAL_ERROR
+    // here (that would trigger the hard init-error loop). Boot resolution checks isnan and fails
+    // closed (MODE_DISABLED), allowing MODE_VERNIER_CALIBRATION to recover. base_sector is a uint8
+    // (isnan inapplicable); it's valid whenever phase_offset is. The joint home lives in
+    // position_controller.position_offset, already restored above.
+    controller->vernier_phase_offset                            = controller_config->vernier_phase_offset;
+    controller->vernier_base_sector                             = controller_config->vernier_base_sector;
   #endif
 
   MotorController_reset(controller);
@@ -425,6 +566,10 @@ void MotorController_update(MotorController *controller) {
 void MotorController_updateService(MotorController *controller) {
   if (controller->mode == MODE_CALIBRATION) {
     MotorController_runCalibrationSequence(controller);
+    return;
+  }
+  if (controller->mode == MODE_VERNIER_CALIBRATION) {
+    MotorController_runVernierCalibration(controller);
     return;
   }
 }
@@ -592,6 +737,114 @@ void MotorController_runCalibrationSequence(MotorController *controller) {
 
   HAL_Delay(1000);
 
+  MotorController_setMode(controller, MODE_IDLE);
+}
+
+void MotorController_runVernierCalibration(MotorController *controller) {
+  // STATIC, NON-DRIVING. The motor is never energized. The operator has hand-placed the free arm
+  // at its known home pose before issuing this command. All reads are blocking with the 10 kHz
+  // TIM1 ISR masked + the bus drained, so they don't collide with the primary's IT reads.
+  const int N = 16;
+
+  // ===== Step 1: vernier_phase_offset — magnet fingerprint, position-independent =====
+  // x = (VERNIER_SECTORS*delta - theta_p)/2pi; frac(x) is the same at every position. We average
+  // it CIRCULARLY (frac wraps at 1.0) and store the within-sector residual in the psi-domain:
+  //   phase_offset = (2pi/VERNIER_SECTORS) * circular_mean(frac)  =  mean_angle / VERNIER_SECTORS.
+  float sum_sin = 0.f, sum_cos = 0.f;
+  uint16_t theta_p_raw = 0, theta_s_raw = 0;
+  for (int i = 0; i < N; i += 1) {
+    __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+    HAL_StatusTypeDef s = MotorController_drainI2C();
+    if (s == HAL_OK) s = MotorController_readEncoderRaw(&controller->encoder, &theta_p_raw);
+    if (s == HAL_OK) s = MotorController_readEncoderRaw(&controller->encoder_secondary, &theta_s_raw);
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+    if (s != HAL_OK) {
+      SET_BITS(controller->error, ERROR_VERNIER_CALIBRATION_FAILED);
+      MotorController_setMode(controller, MODE_IDLE);
+      return;
+    }
+
+    float theta_p = wrapTo2Pi(((float)theta_p_raw / (float)controller->encoder.cpr) * M_2PI_F);
+    float theta_s = MotorController_secondaryAngle(theta_s_raw, controller->encoder_secondary.cpr);
+    float delta = wrapTo2Pi(theta_p - theta_s);
+    float x = ((float)VERNIER_SECTORS * delta - theta_p) / M_2PI_F;
+    float frac = x - floorf(x);                 // [0, 1)
+    float ang = frac * M_2PI_F;                 // map to [0, 2pi) for circular averaging
+    sum_sin += sinf(ang);
+    sum_cos += cosf(ang);
+    HAL_Delay(2);                               // small spacing; ISR runs between samples
+  }
+
+  // Reject if the samples don't cluster (bad magnet, dropout, or wrong VERNIER_SECONDARY_SIGN).
+  // Note frac(x) lives in the x = (16*delta - theta_p)/2pi domain, so its spread is ~16x the raw
+  // delta read noise. We therefore judge tightness in the PSI domain (= ang/16 = raw delta noise),
+  // which is directly comparable to the 5 deg resolution consistency margin. Circular std-dev:
+  //   sigma_ang = sqrt(-2 ln R);  sigma_psi = sigma_ang / VERNIER_SECTORS.
+  // A 0.999 R gate would demand <0.2 deg psi spread (far tighter than AS5600 noise warrants and
+  // prone to spurious failure on a single I2C glitch). Gate at ~2 deg psi spread instead.
+  float R = sqrtf(sum_sin * sum_sin + sum_cos * sum_cos) / (float)N;   // resultant length, ~1 = tight
+  if (R > 1.f) R = 1.f;                                                // guard float overshoot
+  float sigma_psi = (R > 0.f) ? (sqrtf(-2.f * logf(R)) / (float)VERNIER_SECTORS) : M_PI_F;
+  if (sigma_psi > deg2rad(2.0f)) {
+    SET_BITS(controller->error, ERROR_VERNIER_CALIBRATION_FAILED);
+    MotorController_setMode(controller, MODE_IDLE);
+    return;
+  }
+  float mean_ang = wrapTo2Pi(atan2f(sum_sin, sum_cos));                // circular mean of frac, [0, 2pi)
+  controller->vernier_phase_offset = mean_ang / (float)VERNIER_SECTORS;  // psi-domain residual
+
+  // ===== Step 2: vernier_base_sector + position_offset — arm at operator-placed home =====
+  // Settling gate: the joint must be still, else the operator hasn't finished positioning.
+  // NOTE encoder.velocity is the MOTOR-shaft rate (rad/s). With the 15:1 cycloidal gearbox this
+  // threshold (2 deg/s motor) corresponds to ~0.13 deg/s at the arm — intentionally strict, so the
+  // permanent home is captured only when the joint is essentially stationary.
+  if (fabsf(controller->encoder.velocity) > deg2rad(2.0f)) {
+    SET_BITS(controller->error, ERROR_VERNIER_CALIBRATION_FAILED);   // "hold the arm still and retry"
+    MotorController_setMode(controller, MODE_IDLE);
+    return;
+  }
+  __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+  HAL_StatusTypeDef s = MotorController_drainI2C();
+  if (s == HAL_OK) s = MotorController_readEncoderRaw(&controller->encoder, &theta_p_raw);
+  if (s == HAL_OK) s = MotorController_readEncoderRaw(&controller->encoder_secondary, &theta_s_raw);
+  __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+  if (s != HAL_OK) {
+    SET_BITS(controller->error, ERROR_VERNIER_CALIBRATION_FAILED);
+    MotorController_setMode(controller, MODE_IDLE);
+    return;
+  }
+
+  float theta_p = wrapTo2Pi(((float)theta_p_raw / (float)controller->encoder.cpr) * M_2PI_F);
+  float theta_s = MotorController_secondaryAngle(theta_s_raw, controller->encoder_secondary.cpr);
+  float delta = wrapTo2Pi(theta_p - theta_s);
+  float psi   = wrapTo2Pi(delta - theta_p / (float)VERNIER_SECTORS - controller->vernier_phase_offset);
+  int32_t q_raw = lroundf(psi * (float)VERNIER_SECTORS / M_2PI_F);
+  q_raw = ((q_raw % VERNIER_SECTORS) + VERNIER_SECTORS) % VERNIER_SECTORS;
+
+  // Step 2 is a single-shot read that sets the PERMANENT home, so apply the same sector-residual
+  // consistency check that boot resolution uses — reject a glitchy read instead of baking a bad
+  // base_sector / home into Flash.
+  float psi_expected = (float)q_raw * (M_2PI_F / (float)VERNIER_SECTORS);
+  if (fabsf(wrapToPi(psi - psi_expected)) > deg2rad(5.0f)) {
+    SET_BITS(controller->error, ERROR_VERNIER_CALIBRATION_FAILED);
+    MotorController_setMode(controller, MODE_IDLE);
+    return;
+  }
+
+  // Home → renumbered sector 0; the supercycle wrap then sits just below the home (outside travel).
+  controller->vernier_base_sector = (uint8_t)q_raw;
+
+  // Fine zero: at home n_rot = 0, so raw_absolute_arm = theta_p / gear_ratio. Define home = arm 0,
+  // so position_offset = raw_absolute_arm. (Joint home, set at commissioning; same trust model as
+  // flux_offset — not runtime-rewritten.)
+  controller->position_controller.position_offset =
+      theta_p / controller->position_controller.gear_ratio;
+
+  controller->vernier_sector      = (uint8_t)q_raw;
+  controller->vernier_initialized = 1;
+
+  // ===== Step 3: persist and return to a safe operational mode =====
+  MotorController_storeConfig(controller);
   MotorController_setMode(controller, MODE_IDLE);
 }
 

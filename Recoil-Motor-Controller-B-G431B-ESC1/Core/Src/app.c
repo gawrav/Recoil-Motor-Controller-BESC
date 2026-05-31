@@ -40,7 +40,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
   else if (htim == &htim2) {
     #if SAFETY_WATCHDOG_ENABLED
     // watchdog time: 1000ms
-    if (controller.mode != MODE_DISABLED && controller.mode != MODE_IDLE && controller.mode != MODE_CALIBRATION) {
+    if (controller.mode != MODE_DISABLED && controller.mode != MODE_IDLE
+        && controller.mode != MODE_CALIBRATION && controller.mode != MODE_VERNIER_CALIBRATION) {
       MotorController_setMode(&controller, MODE_DAMPING);
       SET_BITS(controller.error, ERROR_WATCHDOG_TIMEOUT);
     }

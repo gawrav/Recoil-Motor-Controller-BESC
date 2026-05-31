@@ -19,6 +19,7 @@
 
 
 #define AS5600_I2C_ADDR             0x36U
+#define AS5600L_I2C_ADDR_SECONDARY  0x40U   // AS5600L default address (secondary on shared bus)
 
 #define AS5600_ZMCO_ADDR            0x00U
 #define AS5600_ZPOS_ADDR            0x01U
@@ -42,7 +43,7 @@ typedef struct {
   uint8_t   i2c_buffer[2];
   uint8_t   UNUSED_0[2];
 
-  uint16_t  UNUSED_1;  // uint16_t  i2c_update_counter;
+  uint16_t  i2c_address;  // already-shifted 7-bit addr (addr << 1); repurposed from UNUSED_1
   uint8_t   UNUSED_2[2];
 
   int32_t   cpr;
@@ -127,9 +128,13 @@ static inline float Encoder_getVelocity(Encoder *encoder) {
  *
  * @param encoder Pointer to the Encoder struct.
  * @param hi2c Pointer to the I2C_HandleTypeDef structure that configures the I2C interface.
- * @return Status of the initialization process. HAL_OK if successful.
+ * @param i2c_address 7-bit device address (e.g. AS5600_I2C_ADDR); stored shifted internally.
+ * @param init_bus Non-zero to (re)initialize the shared I2C peripheral; pass 0 for additional
+ *                 devices on an already-initialized bus (e.g. the secondary encoder).
+ * @return Status of the initialization process. HAL_OK if successful, HAL_ERROR if the device
+ *         did not respond within the bounded probe (e.g. absent secondary).
  */
-HAL_StatusTypeDef Encoder_init(Encoder *encoder, I2C_HandleTypeDef *hi2c);
+HAL_StatusTypeDef Encoder_init(Encoder *encoder, I2C_HandleTypeDef *hi2c, uint16_t i2c_address, uint8_t init_bus);
 
 /**
  * @brief Reset the flux offset and rotation count of the Encoder instance.
