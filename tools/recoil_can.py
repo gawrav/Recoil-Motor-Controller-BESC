@@ -43,7 +43,7 @@ except ImportError:
     sys.exit("python-can not installed.  Run:  pip install python-can")
 
 
-DEFAULT_DEVICE_ID = 1
+DEFAULT_DEVICE_ID = 14   # this board's CAN id (override with --device-id)
 DEFAULT_BITRATE = 1_000_000
 
 # ---- Function codes (FrameFunction enum) ----
@@ -183,6 +183,28 @@ class RecoilCAN:
         # PDO2: [position_target f32, velocity_target f32]
         self._send(FUNC_RECEIVE_PDO_2, struct.pack("<ff", pos, vel))
 
+    def discover(self, timeout=1.0):
+        """Find the device ID by sending a BROADCAST SDO read (device field = 0 in
+        the arbitration ID). The firmware processes broadcasts regardless of its ID
+        and replies on its real ID, so this reveals the ID and proves the bus works.
+        Returns {device_id: device_id_value}.  Empty -> physical-layer problem
+        (termination / bitrate / wiring), not an ID mismatch.
+        """
+        while self.bus.recv(timeout=0.0) is not None:
+            pass
+        req = bytes([0x40, 0x00, 0x00, 0, 0, 0, 0, 0])  # read PARAM_DEVICE_ID (offset 0)
+        self.bus.send(can.Message(arbitration_id=make_id(FUNC_RECEIVE_SDO, 0),
+                                  is_extended_id=False, data=req))
+        found = {}
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            m = self.bus.recv(timeout=max(0.0, deadline - time.time()))
+            if m is None:
+                continue
+            if (m.arbitration_id >> 7) == FUNC_TRANSMIT_SDO and len(m.data) >= 4:
+                found[m.arbitration_id & 0x7F] = struct.unpack("<I", bytes(m.data[:4]))[0]
+        return found
+
 
 def fmt_error(err):
     if err == 0:
@@ -255,6 +277,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="dump key params once")
+    sub.add_parser("discover", help="find device id(s) on the bus via broadcast SDO")
 
     pm = sub.add_parser("monitor", help="poll key params continuously")
     pm.add_argument("--period", type=float, default=0.2)
@@ -283,6 +306,14 @@ def main():
     try:
         if args.cmd == "status":
             cmd_status(dev)
+        elif args.cmd == "discover":
+            found = dev.discover()
+            if not found:
+                print("no devices replied — check termination / bitrate / wiring "
+                      "(this is NOT a device-id issue; broadcast ignores the id)")
+            else:
+                for did, val in sorted(found.items()):
+                    print(f"  device id {did}  (PARAM_DEVICE_ID readback = {val})")
         elif args.cmd == "monitor":
             cmd_monitor(dev, args.period)
         elif args.cmd == "mode":
