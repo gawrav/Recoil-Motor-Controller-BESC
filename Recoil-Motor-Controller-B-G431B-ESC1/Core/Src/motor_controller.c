@@ -572,6 +572,18 @@ void MotorController_updateService(MotorController *controller) {
     MotorController_runVernierCalibration(controller);
     return;
   }
+
+  // Debug/telemetry: keep encoder_secondary.position live while the motor is de-energized
+  // (DISABLED/IDLE) so Level 1-2 bring-up can observe the secondary over CAN. Brief TIM1 mask
+  // at the ~20 Hz updateService rate is harmless with the motor off; intentionally NOT done in
+  // running modes (would blip the FOC loop -- that needs the Phase 2 async path).
+  if (controller->mode == MODE_DISABLED || controller->mode == MODE_IDLE) {
+    __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+    if (MotorController_drainI2C() == HAL_OK) {
+      Encoder_updateBlocking(&controller->encoder_secondary);
+    }
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+  }
 }
 
 void MotorController_runCalibrationSequence(MotorController *controller) {

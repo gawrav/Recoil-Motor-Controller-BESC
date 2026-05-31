@@ -153,4 +153,15 @@ void Encoder_resetFluxOffset(Encoder *encoder);
  */
 HAL_StatusTypeDef Encoder_update(Encoder *encoder);
 
+/**
+ * @brief Synchronous (blocking) single-shot update of position / n_rotations.
+ *
+ * For foreground/low-rate use (boot, calibration, debug telemetry) where the caller
+ * owns the bus (commutation ISR masked). Does not stream via interrupt or update velocity.
+ *
+ * @param encoder Pointer to the Encoder struct.
+ * @return HAL_OK on a valid read, else HAL_ERROR (no device / bad frame).
+ */
+HAL_StatusTypeDef Encoder_updateBlocking(Encoder *encoder);
+
 #endif /* INC_ENCODER_H_ */

@@ -87,3 +87,29 @@ HAL_StatusTypeDef Encoder_update(Encoder *encoder) {
 
   return HAL_OK;
 }
+
+HAL_StatusTypeDef Encoder_updateBlocking(Encoder *encoder) {
+  // Synchronous (blocking) single read + position/n_rotations update. Unlike Encoder_update
+  // (which streams via interrupt and is for the 10 kHz loop), this owns the bus for one
+  // transaction and is meant for foreground/low-rate use (boot, calibration, debug telemetry)
+  // where the caller has masked the commutation ISR. Does NOT touch velocity (call rate varies).
+  uint8_t buf[2];
+  HAL_StatusTypeDef status = HAL_I2C_Mem_Read(encoder->hi2c, encoder->i2c_address,
+                                              AS5600_ANGLE_ADDR, I2C_MEMADD_SIZE_8BIT, buf, 2, 10);
+  if (status != HAL_OK) {
+    return status;
+  }
+  uint16_t raw_reading = (((uint16_t)buf[0]) << 8) | buf[1];
+  if (raw_reading >= abs(encoder->cpr)) {
+    return HAL_ERROR;
+  }
+
+  int16_t reading_delta = encoder->position_raw - raw_reading;
+  if (abs(reading_delta) >= abs(encoder->cpr / 2)) {
+    encoder->n_rotations += ((encoder->cpr * reading_delta) > 0) ? 1 : -1;
+  }
+  encoder->position_raw = raw_reading;
+  encoder->position = (((float)raw_reading / (float)encoder->cpr) + encoder->n_rotations) * (M_2PI_F);
+
+  return HAL_OK;
+}
