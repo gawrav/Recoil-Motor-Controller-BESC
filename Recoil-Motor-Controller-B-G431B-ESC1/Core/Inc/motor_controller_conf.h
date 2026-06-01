@@ -86,6 +86,12 @@
 // boot resolution succeeds across the full range, not just at home.
 #define VERNIER_SECONDARY_SIGN          (+1)
 
+// Calibration validity sentinel. runVernierCalibration writes this into
+// vernier_cal_magic on success; boot resolution refuses to resolve unless it matches.
+// Robust against stale/zeroed/erased flash masquerading as a valid (zero) calibration
+// (isnan alone is not — leftover 0x00000000 reads as float 0.0, not NaN). ASCII "VERN".
+#define VERNIER_CAL_MAGIC               0x5645524EU
+
 /** ======== Motor Selection ======== **/
 
 #define MOTORPROFILE_MAD_M6C12_150KV
@@ -292,6 +298,7 @@ typedef enum {
   PARAM_VERNIER_PHASE_OFFSET                            = 0x56CU,  // calibrated magnet fingerprint (read-only)
   PARAM_VERNIER_BASE_SECTOR                             = 0x570U,  // calibrated sector origin (read-only)
   PARAM_VERNIER_SECTOR                                  = 0x571U,  // live resolved sector (read-only)
+  PARAM_VERNIER_CAL_MAGIC                               = 0x578U,  // == VERNIER_CAL_MAGIC iff calibrated (read-only)
 } Parameter;
 
 

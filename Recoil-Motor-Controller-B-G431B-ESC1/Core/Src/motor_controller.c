@@ -21,6 +21,8 @@ _Static_assert(offsetof(MotorController, vernier_base_sector) == PARAM_VERNIER_B
                "PARAM_VERNIER_BASE_SECTOR mismatch");
 _Static_assert(offsetof(MotorController, vernier_sector) == PARAM_VERNIER_SECTOR,
                "PARAM_VERNIER_SECTOR mismatch");
+_Static_assert(offsetof(MotorController, vernier_cal_magic) == PARAM_VERNIER_CAL_MAGIC,
+               "PARAM_VERNIER_CAL_MAGIC mismatch");
 _Static_assert(sizeof(MotorController) <= FLASH_PAGE_SIZE,
                "MotorController no longer fits in one Flash page");
 // Existing primary encoder offset must not have shifted (regression guard for review M-4):
@@ -59,6 +61,7 @@ void MotorController_init(MotorController *controller) {
   controller->vernier_sector       = 0;
   controller->vernier_initialized  = 0;
   controller->vernier_sanity_counter = 0;
+  controller->vernier_cal_magic    = 0;   // 0 = uncalibrated until loadConfig/calibration says otherwise
 
   HAL_StatusTypeDef status = HAL_OK;
   uint32_t init_error_step = 0;
@@ -188,8 +191,11 @@ static inline float MotorController_secondaryAngle(uint16_t raw_s, int32_t cpr) 
 }
 
 HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *controller) {
-  // Uncalibrated unit (no valid magnet fingerprint) → fail closed; requires MODE_VERNIER_CALIBRATION.
-  if (isnan(controller->vernier_phase_offset)) {
+  // Uncalibrated unit -> fail closed; requires MODE_VERNIER_CALIBRATION.
+  // The magic word is the primary gate: it is robust against stale/zeroed/erased flash that an
+  // isnan-only check would mistake for a valid zero calibration. isnan kept as a belt-and-suspenders
+  // guard against a corrupted-but-magic-matching record.
+  if (controller->vernier_cal_magic != VERNIER_CAL_MAGIC || isnan(controller->vernier_phase_offset)) {
     SET_BITS(controller->error, ERROR_VERNIER_CALIBRATION_FAILED);
     return HAL_ERROR;
   }
@@ -418,6 +424,7 @@ HAL_StatusTypeDef MotorController_loadConfig(MotorController *controller) {
     // position_controller.position_offset, already restored above.
     controller->vernier_phase_offset                            = controller_config->vernier_phase_offset;
     controller->vernier_base_sector                             = controller_config->vernier_base_sector;
+    controller->vernier_cal_magic                               = controller_config->vernier_cal_magic;
   #endif
 
   MotorController_reset(controller);
@@ -854,6 +861,11 @@ void MotorController_runVernierCalibration(MotorController *controller) {
 
   controller->vernier_sector      = (uint8_t)q_raw;
   controller->vernier_initialized = 1;
+
+  // Stamp the calibration valid only after all steps succeeded. This is what lets boot
+  // resolution trust the stored constants (and distinguishes a real calibration from
+  // stale/zeroed flash).
+  controller->vernier_cal_magic   = VERNIER_CAL_MAGIC;
 
   // ===== Step 3: persist and return to a safe operational mode =====
   MotorController_storeConfig(controller);

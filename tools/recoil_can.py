@@ -105,7 +105,10 @@ PARAMS = {
     "vernier_phase_offset": (0x56C, "f32"),
     # vernier_base_sector (u8 @0x570) and vernier_sector (u8 @0x571) share one word:
     "vernier_status_word":  (0x570, "u32"),
+    "vernier_cal_magic":    (0x578, "u32"),
 }
+
+VERNIER_CAL_MAGIC = 0x5645524E   # "VERN"; == means genuinely calibrated
 
 
 def make_id(func, device_id):
@@ -219,9 +222,12 @@ def cmd_status(dev):
     word = int(dev.read("vernier_status_word"))
     base_sector = word & 0xFF
     sector = (word >> 8) & 0xFF
+    magic = int(dev.read("vernier_cal_magic"))
+    calibrated = "YES" if magic == VERNIER_CAL_MAGIC else f"NO (magic=0x{magic:08X})"
     print(f"  firmware:    0x{int(dev.read('firmware_version')):08X}")
     print(f"  mode:        0x{mode:02X} ({MODE_NAMES.get(mode, '?')})")
     print(f"  error:       {fmt_error(err)}")
+    print(f"  calibrated:  {calibrated}")
     print(f"  gear_ratio:  {dev.read('gear_ratio'):.4f}")
     print(f"  phase_offset:{dev.read('vernier_phase_offset'):+.5f} rad")
     print(f"  base_sector: {base_sector}")

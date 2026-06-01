@@ -54,6 +54,7 @@ typedef struct {
   uint8_t             UNUSED_vernier_pad;       // alignment pad
   uint16_t            vernier_sanity_counter;   // deferred runtime sanity check (Phase 2)
   uint16_t            UNUSED_vernier_pad2;      // alignment pad
+  uint32_t            vernier_cal_magic;        // == VERNIER_CAL_MAGIC iff genuinely calibrated; persisted
 } MotorController;
 
 /**
