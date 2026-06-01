@@ -54,6 +54,9 @@ FUNC_TRANSMIT_SDO = 0xB
 FUNC_RECEIVE_SDO  = 0xC
 FUNC_FLASH        = 0xD
 FUNC_HEARTBEAT    = 0xE
+FUNC_SYSTEM       = 0xF
+
+SYSTEM_CMD_RECOVER_I2C = 1
 
 # ---- Modes (Mode enum) ----
 MODES = {
@@ -175,6 +178,10 @@ class RecoilCAN:
     def write(self, name, value):
         offset, kind = PARAMS[name]
         self.sdo_write(offset, value, kind)
+
+    def recover_i2c(self):
+        # Request I2C bus recovery; firmware performs it in the foreground (~1 cycle later).
+        self._send(FUNC_SYSTEM, [SYSTEM_CMD_RECOVER_I2C])
 
     def flash_store(self):
         self._send(FUNC_FLASH, [1])
@@ -300,6 +307,7 @@ def main():
 
     sub.add_parser("flash-store", help="persist config to flash")
     sub.add_parser("flash-load", help="reload config from flash")
+    sub.add_parser("recover", help="request I2C bus recovery, then poll status")
 
     ppos = sub.add_parser("setpos", help="send a position target (PDO2)")
     ppos.add_argument("position", type=float)
@@ -332,6 +340,11 @@ def main():
             val = float(args.value) if kind == "f32" else int(args.value, 0)
             dev.write(args.name, val)
             print(f"wrote {args.name} = {val} (no ack; read back to confirm)")
+        elif args.cmd == "recover":
+            dev.recover_i2c()
+            print("I2C recovery requested; polling status...")
+            time.sleep(0.3)   # let the foreground perform it (~20 Hz service loop)
+            cmd_status(dev)
         elif args.cmd == "flash-store":
             dev.flash_store()
             print("FLASH store sent")

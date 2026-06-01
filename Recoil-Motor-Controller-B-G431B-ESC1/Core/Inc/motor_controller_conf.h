@@ -206,7 +206,15 @@ typedef enum {
   FUNC_RECEIVE_SDO              = 0b1100U,
   FUNC_FLASH                    = 0b1101U,
   FUNC_HEARTBEAT                = 0b1110U,
+  FUNC_SYSTEM                   = 0b1111U,   // system commands; data[0] selects action (see SYSTEM_CMD_*)
 } FrameFunction;
+
+/**
+ * @brief FUNC_SYSTEM subcommands (data[0]).
+ */
+typedef enum {
+  SYSTEM_CMD_RECOVER_I2C        = 1U,   // attempt I2C bus recovery (host polls status to confirm)
+} SystemCommand;
 
 /**
  * @brief CAN Parameter ID definition.

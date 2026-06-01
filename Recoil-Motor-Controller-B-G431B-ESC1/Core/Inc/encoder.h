@@ -164,4 +164,16 @@ HAL_StatusTypeDef Encoder_update(Encoder *encoder);
  */
 HAL_StatusTypeDef Encoder_updateBlocking(Encoder *encoder);
 
+/**
+ * @brief Recover a hung I2C bus (slave holding SDA low) by bit-banging up to 9 SCL pulses + STOP,
+ *        then re-initializing the peripheral. Frees whichever device is stuck on the shared bus.
+ *
+ * Must be called from the foreground with the commutation ISR masked and the motor de-energized.
+ * Encoder accumulator state is preserved.
+ *
+ * @param encoder Pointer to an Encoder on the bus to recover (uses its hi2c handle).
+ * @return HAL_OK if SDA was released and the peripheral re-initialized, else HAL_ERROR.
+ */
+HAL_StatusTypeDef Encoder_recoverBus(Encoder *encoder);
+
 #endif /* INC_ENCODER_H_ */

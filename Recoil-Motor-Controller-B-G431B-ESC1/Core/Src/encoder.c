@@ -88,6 +88,90 @@ HAL_StatusTypeDef Encoder_update(Encoder *encoder) {
   return HAL_OK;
 }
 
+// Approximate busy-wait for the bit-banged recovery clock. Exact rate is NOT critical: any
+// ~10-400 kHz clocking frees a stuck slave, so a conservative (slow) delay is fine. volatile
+// keeps the loop from being optimized away.
+static void Encoder_busDelay(void) {
+  for (volatile uint32_t i = 0; i < 800; i += 1) {
+    __NOP();
+  }
+}
+
+HAL_StatusTypeDef Encoder_recoverBus(Encoder *encoder) {
+  // Free a hung I2C bus: a slave stuck mid-byte holds SDA low and won't release until it is
+  // clocked through the rest of its byte. Sequence: de-init the peripheral, bit-bang up to 9 SCL
+  // pulses until SDA releases, issue a STOP, then re-init. I2C1 is SDA=PB7, SCL=PB8 on GPIOB.
+  // MUST be called from the foreground with the commutation ISR masked and the motor de-energized
+  // (caller's responsibility). Encoder n_rotations is preserved across recovery.
+  GPIO_InitTypeDef gpio = {0};
+
+  // A primary-encoder IT receive is almost always in flight (the 10 kHz loop issues one every
+  // cycle in all modes), and the I2C1_EV ISR (priority 1) preempts this foreground code. Disable
+  // it BEFORE tearing the peripheral down so its completion handler can't race HAL_I2C_DeInit on a
+  // half-reset handle (review C1). The in-flight transfer is simply abandoned — we re-init below.
+  HAL_NVIC_DisableIRQ(I2C1_EV_IRQn);
+  HAL_I2C_DeInit(encoder->hi2c);          // disables PE (aborts xfer at peripheral) + MspDeInit
+  HAL_NVIC_ClearPendingIRQ(I2C1_EV_IRQn); // drop any stale event from the abandoned transfer
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+
+  // SCL (PB8) open-drain output, SDA (PB7) input; pull-ups keep the bus idling high.
+  gpio.Mode = GPIO_MODE_OUTPUT_OD;
+  gpio.Pull = GPIO_PULLUP;
+  gpio.Speed = GPIO_SPEED_FREQ_LOW;
+  gpio.Pin = GPIO_PIN_8;
+  HAL_GPIO_Init(GPIOB, &gpio);
+  gpio.Pin = GPIO_PIN_7;
+  gpio.Mode = GPIO_MODE_INPUT;
+  HAL_GPIO_Init(GPIOB, &gpio);
+
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   // SCL idle high
+  Encoder_busDelay();
+
+  // Up to 9 clocks; stop early once the slave releases SDA (reads high).
+  for (int i = 0; i < 9 && HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_RESET; i += 1) {
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_RESET);  // SCL low
+    Encoder_busDelay();
+    HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);    // SCL high
+    Encoder_busDelay();
+  }
+  uint8_t recovered = (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_7) == GPIO_PIN_SET);
+
+  // Manual STOP: SDA low->high while SCL high, to reset every slave's state machine.
+  gpio.Pin = GPIO_PIN_7;
+  gpio.Mode = GPIO_MODE_OUTPUT_OD;
+  HAL_GPIO_Init(GPIOB, &gpio);
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_RESET); Encoder_busDelay();  // SDA low
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_8, GPIO_PIN_SET);   Encoder_busDelay();  // SCL high
+  HAL_GPIO_WritePin(GPIOB, GPIO_PIN_7, GPIO_PIN_SET);   Encoder_busDelay();  // SDA high = STOP
+
+  // Restore the I2C peripheral + AF pins (MspInit reconfigures PB7/PB8 to AF4_I2C1 and re-enables
+  // the I2C1_EV IRQ). (void)recovered: SDA-release is informational; the verification read below
+  // is the real success criterion.
+  (void)recovered;
+  if (HAL_I2C_Init(encoder->hi2c) != HAL_OK) {
+    // Re-enable the IRQ even on Init failure, so a later recovery attempt can still complete an
+    // async read instead of being permanently wedged with the EV interrupt masked (review MINOR-1).
+    HAL_NVIC_EnableIRQ(I2C1_EV_IRQn);
+    return HAL_ERROR;
+  }
+
+  // Verify the device actually responds AND prime i2c_buffer with a fresh, in-range reading.
+  // This both confirms recovery (vs. just SDA being electrically free) and prevents the next
+  // async Encoder_update from parsing a stale/out-of-range buffer and re-asserting the fault
+  // (review M2). Resync position_raw to the primed value so that update sees delta=0 (no spurious
+  // multi-turn crossing); n_rotations is preserved (assumes no full-rev motion while hung).
+  if (HAL_I2C_Mem_Read(encoder->hi2c, encoder->i2c_address, AS5600_ANGLE_ADDR,
+                       I2C_MEMADD_SIZE_8BIT, encoder->i2c_buffer, 2, 10) != HAL_OK) {
+    return HAL_ERROR;
+  }
+  uint16_t raw_reading = (((uint16_t)encoder->i2c_buffer[0]) << 8) | encoder->i2c_buffer[1];
+  if (raw_reading >= abs(encoder->cpr)) {
+    return HAL_ERROR;
+  }
+  encoder->position_raw = raw_reading;
+  return HAL_OK;
+}
+
 HAL_StatusTypeDef Encoder_updateBlocking(Encoder *encoder) {
   // Synchronous (blocking) single read + position/n_rotations update. Unlike Encoder_update
   // (which streams via interrupt and is for the 10 kHz loop), this owns the bus for one

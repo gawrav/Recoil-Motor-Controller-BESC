@@ -29,6 +29,11 @@ _Static_assert(sizeof(MotorController) <= FLASH_PAGE_SIZE,
 _Static_assert(offsetof(MotorController, encoder.position_offset) == PARAM_ENCODER_POSITION_OFFSET,
                "primary PARAM offsets shifted - existing CAN/Flash access broken");
 
+// Set by the FUNC_SYSTEM/SYSTEM_CMD_RECOVER_I2C CAN command (ISR context); serviced in the
+// foreground by MotorController_updateService. The recovery itself (deinit/bit-bang/reinit, ~1 ms)
+// must NOT run in the CAN ISR.
+static volatile uint8_t i2c_recovery_request = 0;
+
 extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
 extern FDCAN_HandleTypeDef hfdcan1;
@@ -580,6 +585,25 @@ void MotorController_updateService(MotorController *controller) {
     return;
   }
 
+  // Host-requested I2C bus recovery (FUNC_SYSTEM/SYSTEM_CMD_RECOVER_I2C). Performed here in the
+  // foreground, not in the CAN ISR. Only while de-energized (DISABLED/IDLE/DAMPING) — masking TIM1
+  // mid-drive would disrupt FOC. After a fault the controller is already in DAMPING, so the normal
+  // path is covered. On success the bus is freed and ERROR_ENCODER_FAULT is cleared; the mode is
+  // left as-is (host re-commands). On failure the fault remains set, so polling status reports it.
+  if (i2c_recovery_request) {
+    i2c_recovery_request = 0;
+    if (controller->mode == MODE_DISABLED || controller->mode == MODE_IDLE
+        || controller->mode == MODE_DAMPING) {
+      __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
+      HAL_StatusTypeDef r = Encoder_recoverBus(&controller->encoder);
+      __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+      if (r == HAL_OK) {
+        CLEAR_BITS(controller->error, ERROR_ENCODER_FAULT);
+      }
+    }
+    return;
+  }
+
   // Debug/telemetry: keep encoder_secondary.position live while the motor is de-energized
   // (DISABLED/IDLE) so Level 1-2 bring-up can observe the secondary over CAN. Brief TIM1 mask
   // at the ~20 Hz updateService rate is harmless with the motor off; intentionally NOT done in
@@ -950,6 +974,14 @@ void MotorController_handleCANMessage(MotorController *controller, CAN_Frame *rx
 
     case FUNC_HEARTBEAT:
       __HAL_TIM_SET_COUNTER(&htim2, 0);
+      break;
+
+    case FUNC_SYSTEM:
+      // Only flag the request here (ISR context). The actual recovery (slow: deinit/bit-bang/
+      // reinit) runs in the foreground updateService. Host polls status to confirm the result.
+      if (rx_frame->size && *((uint8_t *)rx_frame->data) == SYSTEM_CMD_RECOVER_I2C) {
+        i2c_recovery_request = 1;
+      }
       break;
   }
 
