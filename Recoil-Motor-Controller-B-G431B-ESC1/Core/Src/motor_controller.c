@@ -28,6 +28,11 @@ _Static_assert(sizeof(MotorController) <= FLASH_PAGE_SIZE,
 // Existing primary encoder offset must not have shifted (regression guard for review M-4):
 _Static_assert(offsetof(MotorController, encoder.position_offset) == PARAM_ENCODER_POSITION_OFFSET,
                "primary PARAM offsets shifted - existing CAN/Flash access broken");
+// Pin the offsets the host tool (recoil_can.py set-zero / status) reads/writes:
+_Static_assert(offsetof(MotorController, position_controller.position_offset) == PARAM_POSITION_CONTROLLER_POSITION_OFFSET,
+               "position_controller.position_offset offset shifted - host set-zero would corrupt memory");
+_Static_assert(offsetof(MotorController, position_controller.position_measured) == PARAM_POSITION_CONTROLLER_POSITION_MEASURED,
+               "position_controller.position_measured offset shifted - host telemetry stale");
 
 // Set by the FUNC_SYSTEM/SYSTEM_CMD_RECOVER_I2C CAN command (ISR context); serviced in the
 // foreground by MotorController_updateService. The recovery itself (deinit/bit-bang/reinit, ~1 ms)
@@ -237,8 +242,12 @@ HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *contr
     return HAL_ERROR;
   }
 
-  // Renumber so the supercycle wrap sits outside the arm's travel (vernier_base_sector).
-  int32_t n_rot = (q_raw - (int32_t)controller->vernier_base_sector + VERNIER_SECTORS) % VERNIER_SECTORS;
+  // Renumber relative to the calibrated home, biased so the supercycle wrap sits outside travel
+  // (see VERNIER_SECTOR_BIAS). BIAS=0 -> n_rot in [0,15] (home at extreme); BIAS=8 -> [-8,+7]
+  // (home centered, wrap at the antipode). At home q_raw==base_sector so n_rot==0 for any BIAS.
+  int32_t d = q_raw - (int32_t)controller->vernier_base_sector + VERNIER_SECTOR_BIAS;
+  d = ((d % VERNIER_SECTORS) + VERNIER_SECTORS) % VERNIER_SECTORS;   // [0,15]
+  int32_t n_rot = d - VERNIER_SECTOR_BIAS;                           // [-BIAS, 15-BIAS]
 
   // Seed atomically (review M1): position_raw consistent with n_rotations + position, so the next
   // Encoder_update's multi-turn crossing logic (encoder.c) doesn't spuriously bump n_rotations.
@@ -507,6 +516,25 @@ void MotorController_update(MotorController *controller) {
         controller->motor.torque_constant
       * controller->current_controller.i_q_measured
       * controller->position_controller.gear_ratio;
+
+  // Overtravel guard (failed hard stop): if the trusted absolute position has driven beyond the
+  // configured soft limits by more than POSITION_OVERTRAVEL_MARGIN, something let the arm past
+  // where a healthy stop allows -> fault to DAMPING. Only in closed-loop driving modes (motor
+  // energized, position trusted via the vernier); inert when limits are +/-INFINITY (unconfigured).
+  // position_measured and position_limit_* share the same (internal) frame, so compare directly.
+  // All motor-energized modes: closed-loop (0x10..0x13) and open-loop overrides (0x20..0x22).
+  if (controller->vernier_initialized
+      && ((controller->mode >= MODE_CURRENT && controller->mode <= MODE_POSITION)
+          || (controller->mode >= MODE_VABC_OVERRIDE && controller->mode <= MODE_VQD_OVERRIDE))) {
+    float pos = controller->position_controller.position_measured;
+    float lo  = controller->position_controller.position_limit_lower;
+    float hi  = controller->position_controller.position_limit_upper;
+    if ((isfinite(lo) && pos < lo - POSITION_OVERTRAVEL_MARGIN)
+        || (isfinite(hi) && pos > hi + POSITION_OVERTRAVEL_MARGIN)) {
+      controller->error |= ERROR_OVERTRAVEL;
+      MotorController_setMode(controller, MODE_DAMPING);
+    }
+  }
 
   // takes 1.3 us to run (3%)
   PositionController_update(&controller->position_controller, controller->mode);
@@ -874,7 +902,8 @@ void MotorController_runVernierCalibration(MotorController *controller) {
     return;
   }
 
-  // Home → renumbered sector 0; the supercycle wrap then sits just below the home (outside travel).
+  // Home → renumbered sector 0 (boot resolution uses VERNIER_SECTOR_BIAS to place the wrap: just
+  // below home if BIAS=0, or at the antipode home±8 revs if BIAS=8/centered).
   controller->vernier_base_sector = (uint8_t)q_raw;
 
   // Fine zero: at home n_rot = 0, so raw_absolute_arm = theta_p / gear_ratio. Define home = arm 0,

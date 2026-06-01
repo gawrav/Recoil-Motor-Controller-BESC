@@ -86,6 +86,23 @@
 // boot resolution succeeds across the full range, not just at home.
 #define VERNIER_SECONDARY_SIGN          (+1)
 
+// Where the supercycle wrap sits relative to the calibrated home, via the boot-resolution
+// renumber n_rot = ((q_raw - base_sector + BIAS) mod 16) - BIAS:
+//   0 = home at a travel extreme; usable range n_rot [0,15] (all above home). Best for joints
+//       whose travel approaches the full 384° unique range (slack concentrated at one end).
+//   8 = home centered; usable range n_rot [-8,+7], wrap parked at the antipode (home ±8 revs =
+//       ±192° arm). Best for small joints (e.g. <=180°): the wrap lands ~100°+ beyond EACH hard
+//       stop, so absolute position stays valid even if a stop fails and the arm overtravels.
+// For this robot's <=180° joints, 8 (centered) gives symmetric overtravel protection at both edges.
+#define VERNIER_SECTOR_BIAS             8
+
+// Overtravel guard: if the measured arm position exceeds the configured soft limits
+// (position_limit_lower/upper) by more than this margin, the arm has driven past where a healthy
+// hard stop would allow (e.g. a cracked/bent stop) -> fault to DAMPING. Arm-frame radians. The
+// margin keeps the arm legitimately sitting AT a limit from false-tripping. Only active when the
+// limits are finite (configured); with the default +/-INFINITY limits the guard is disabled.
+#define POSITION_OVERTRAVEL_MARGIN      (0.2618f)   // ~15 deg at the arm
+
 // Calibration validity sentinel. runVernierCalibration writes this into
 // vernier_cal_magic on success; boot resolution refuses to resolve unless it matches.
 // Robust against stale/zeroed/erased flash masquerading as a valid (zero) calibration
@@ -184,6 +201,7 @@ typedef enum {
   ERROR_ENCODER_FAULT             = 0b0010000000000000U,
   ERROR_VERNIER_INCONSISTENT      = 0b0100000000000000U,  // boot sector cross-check failed / uncalibrated
   ERROR_VERNIER_CALIBRATION_FAILED= 0b1000000000000000U,  // vernier calibration could not complete
+  ERROR_OVERTRAVEL                = (1U << 16),            // measured position beyond limits (failed hard stop)
 } ErrorCode;
 
 /** ======== CAN Packet Definitions ======== **/

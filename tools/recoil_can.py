@@ -90,6 +90,7 @@ ERROR_BITS = {
     0x2000: "ENCODER_FAULT",
     0x4000: "VERNIER_INCONSISTENT",
     0x8000: "VERNIER_CALIBRATION_FAILED",
+    0x10000: "OVERTRAVEL",
 }
 
 # ---- Parameter registry: name -> (byte_offset, type) ----
@@ -100,8 +101,9 @@ PARAMS = {
     "mode":                 (0x010, "u32"),
     "error":                (0x014, "u32"),
     "gear_ratio":           (0x01C, "f32"),
+    "position_offset":      (0x040, "f32"),   # arm-frame zero (position_controller.position_offset)
     "position_target":      (0x05C, "f32"),
-    "position_measured":    (0x060, "f32"),
+    "position_measured":    (0x060, "f32"),   # raw arm position (absolute, NO offset applied)
     "encoder_n_rotations":  (0x130, "i32"),
     "encoder_position":     (0x134, "f32"),
     "encoder2_position":    (0x360, "f32"),
@@ -183,6 +185,16 @@ class RecoilCAN:
         # Request I2C bus recovery; firmware performs it in the foreground (~1 cycle later).
         self._send(FUNC_SYSTEM, [SYSTEM_CMD_RECOVER_I2C])
 
+    def set_zero(self):
+        # Make the CURRENT arm position read zero in the control/telemetry frame, by setting
+        # position_offset = raw position_measured. Does NOT move the wrap (that's the
+        # vernier base_sector) — only shifts where "zero" lands. Persisted to flash.
+        # Returns (raw_before, offset_written).
+        pm = self.read("position_measured")     # 0x060: raw absolute arm angle (no offset)
+        self.write("position_offset", pm)        # getter returns position_measured - offset -> 0 here
+        self.flash_store()
+        return pm
+
     def flash_store(self):
         self._send(FUNC_FLASH, [1])
 
@@ -242,7 +254,11 @@ def cmd_status(dev):
     print(f"  n_rotations: {int(dev.read('encoder_n_rotations'))}")
     print(f"  enc pos:     {dev.read('encoder_position'):+.5f} rad (motor)")
     print(f"  enc2 pos:    {dev.read('encoder2_position'):+.5f} rad")
-    print(f"  arm pos:     {dev.read('position_measured'):+.5f} rad")
+    pm = dev.read("position_measured")
+    off = dev.read("position_offset")
+    print(f"  arm pos raw: {pm:+.5f} rad (absolute, no offset)")
+    print(f"  position_offset: {off:+.5f} rad")
+    print(f"  arm pos:     {pm - off:+.5f} rad (zeroed = host/PDO frame)")
 
 
 def cmd_monitor(dev, period):
@@ -308,6 +324,7 @@ def main():
     sub.add_parser("flash-store", help="persist config to flash")
     sub.add_parser("flash-load", help="reload config from flash")
     sub.add_parser("recover", help="request I2C bus recovery, then poll status")
+    sub.add_parser("set-zero", help="make the current arm position read zero (sets position_offset, flash)")
 
     ppos = sub.add_parser("setpos", help="send a position target (PDO2)")
     ppos.add_argument("position", type=float)
@@ -345,6 +362,12 @@ def main():
             print("I2C recovery requested; polling status...")
             time.sleep(0.3)   # let the foreground perform it (~20 Hz service loop)
             cmd_status(dev)
+        elif args.cmd == "set-zero":
+            pm = dev.set_zero()
+            print(f"zeroed at raw arm pos {pm:+.5f} rad; current position now reads ~0 "
+                  f"(persisted). re-run `status` to confirm.")
+            print("NOTE: position_limit_lower/upper and the overtravel guard are evaluated in the "
+                  "ABSOLUTE (raw) frame — they do NOT shift with this zero.")
         elif args.cmd == "flash-store":
             dev.flash_store()
             print("FLASH store sent")
