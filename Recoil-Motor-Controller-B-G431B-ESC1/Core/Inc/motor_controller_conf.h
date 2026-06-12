@@ -78,13 +78,16 @@
 // motor's increases. The vernier math requires the secondary angle to increase in the SAME
 // sense as (15/16)*motor, so we negate it in software by default. Set to +1 if the secondary's
 // DIR pin / magnet polarity already compensates the mesh inversion in hardware.
-// Determined empirically on this rig: with the secondary read raw (no sign), enc2 tracks the
-// primary in the SAME direction at ~15/16 rate (bench monitor, hand-rotate), so no inversion is
-// needed. (The spur pair counter-rotates mechanically, but magnet/DIR orientation nets to
-// forward-reading.) A wrong choice mis-scales delta to (31/16)*alpha — calibration can falsely
-// pass at the home position yet mis-resolve the sector at other positions, so verify by checking
-// boot resolution succeeds across the full range, not just at home.
-#define VERNIER_SECONDARY_SIGN          (+1)
+// History on this rig: with the secondary breakout's DIR pad unsoldered (floating), the chip
+// read forward (enc2 tracked the primary in the SAME direction), so this was briefly +1. After
+// fixing the missing DIR-to-VCC solder joint, the chip's count direction inverted: the raw enc2
+// now tracks the primary in the OPPOSITE direction (external 15T/16T mesh reversal, no longer
+// masked by the floating DIR), so software negates it again.
+// A wrong choice mis-scales delta to (31/16)*alpha — calibration can falsely pass at the home
+// position yet mis-resolve the sector at other positions. After ANY change to this sign or to
+// the DIR wiring: verify direction with the bench monitor (enc2 vs enc), re-run
+// MODE_VERNIER_CALIBRATION, and check boot resolution across the full range, not just at home.
+#define VERNIER_SECONDARY_SIGN          (-1)
 
 // Where the supercycle wrap sits relative to the calibrated home, via the boot-resolution
 // renumber n_rot = ((q_raw - base_sector + BIAS) mod 16) - BIAS:
