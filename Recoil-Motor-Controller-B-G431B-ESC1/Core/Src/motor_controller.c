@@ -267,6 +267,15 @@ static void MotorController_captureEncoderHealth(MotorController *controller) {
   controller->diag_enc_agc         = (MotorController_readEncoderReg(&controller->encoder, AS5600_AGC_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
   controller->diag_enc2_status_reg = (MotorController_readEncoderReg(&controller->encoder_secondary, AS5600_STATUS_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
   controller->diag_enc2_agc        = (MotorController_readEncoderReg(&controller->encoder_secondary, AS5600_AGC_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
+
+  // CRITICAL: the STATUS/AGC reads above moved the AS5600 register pointer off ANGLE. The 10 kHz
+  // streaming read (Encoder_update -> HAL_I2C_Master_Receive_IT) reads 2 bytes from the CURRENT
+  // pointer with NO register address, relying on it sitting at ANGLE (0x0E) - so we must restore
+  // it, or streaming returns garbage (raw >= cpr -> ENCODER_FAULT). Re-prime the PRIMARY's ANGLE
+  // pointer and refresh its i2c_buffer so the first streaming read sees a valid value. The
+  // secondary is never streamed (resolve always addresses it explicitly), so it needs no re-prime.
+  HAL_I2C_Mem_Read(&hi2c1, controller->encoder.i2c_address, AS5600_ANGLE_ADDR,
+                   I2C_MEMADD_SIZE_8BIT, controller->encoder.i2c_buffer, 2, 10);
 }
 
 HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *controller) {
