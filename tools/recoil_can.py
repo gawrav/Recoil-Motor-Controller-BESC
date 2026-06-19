@@ -127,6 +127,8 @@ PARAMS = {
     "diag_psi":              (0x5A0, "f32"),
     "diag_psi_error":        (0x5A4, "f32"),
     "diag_q_raw":            (0x5A8, "i32"),
+    "diag_consec_frame_err":     (0x5AC, "u32"),
+    "diag_max_consec_frame_err": (0x5B0, "u32"),
 }
 
 # AS5600/AS5600L STATUS reg 0x0B: MD=detected (good), ML=too weak, MH=too strong.
@@ -338,9 +340,13 @@ def print_diag(dev, indent=""):
           f"q_raw={int(dev.read('diag_q_raw'))}  psi_err={math.degrees(dev.read('diag_psi_error')):+.2f} deg")
     print(f"{indent}           theta_p={dev.read('diag_theta_p'):+.4f}  theta_s={dev.read('diag_theta_s'):+.4f}  "
           f"psi={dev.read('diag_psi'):+.4f} rad")
-    # Counters are absolute (wrap ~5 days @10kHz); poll twice for a rate.
+    # Counters are absolute (wrap ~5 days @10kHz); poll twice for a rate. frame_err is now a TRUE
+    # distinct-glitch count (the read is re-armed each time). max_consec = worst burst: 1 means
+    # every glitch was isolated and self-recovered; approaching the fault threshold means real bursts.
     print(f"{indent}primary live: ok={int(dev.read('diag_ok_count'))}  "
           f"frame_err={int(dev.read('diag_frame_err_count'))}  "
+          f"consec={int(dev.read('diag_consec_frame_err'))}  "
+          f"max_consec={int(dev.read('diag_max_consec_frame_err'))}  "
           f"start_fail={int(dev.read('diag_start_fail_count'))}  "
           f"i2c_err={int(dev.read('diag_i2c_err_count'))}  "
           f"last_i2c={fmt_i2c_errcode(int(dev.read('diag_last_i2c_errcode')))}")

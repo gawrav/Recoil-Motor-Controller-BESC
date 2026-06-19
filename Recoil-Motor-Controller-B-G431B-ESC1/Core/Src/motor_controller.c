@@ -43,6 +43,10 @@ _Static_assert(offsetof(MotorController, diag_theta_s) == PARAM_DIAG_THETA_S, "P
 _Static_assert(offsetof(MotorController, diag_psi) == PARAM_DIAG_PSI, "PARAM_DIAG_PSI mismatch");
 _Static_assert(offsetof(MotorController, diag_psi_error) == PARAM_DIAG_PSI_ERROR, "PARAM_DIAG_PSI_ERROR mismatch");
 _Static_assert(offsetof(MotorController, diag_q_raw) == PARAM_DIAG_Q_RAW, "PARAM_DIAG_Q_RAW mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_consecutive_frame_errors) == PARAM_DIAG_ENC_CONSEC_FRAME_ERRORS,
+               "PARAM_DIAG_ENC_CONSEC_FRAME_ERRORS mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_max_consecutive_frame_errors) == PARAM_DIAG_ENC_MAX_CONSEC_FRAME_ERRORS,
+               "PARAM_DIAG_ENC_MAX_CONSEC_FRAME_ERRORS mismatch");
 _Static_assert(sizeof(MotorController) <= FLASH_PAGE_SIZE,
                "MotorController no longer fits in one Flash page");
 // Existing primary encoder offset must not have shifted (regression guard for review M-4):
@@ -119,6 +123,8 @@ void MotorController_init(MotorController *controller) {
   controller->diag_psi = 0.f;
   controller->diag_psi_error = 0.f;
   controller->diag_q_raw = 0;
+  controller->diag_enc_consecutive_frame_errors     = 0;
+  controller->diag_enc_max_consecutive_frame_errors = 0;
 
   HAL_StatusTypeDef status = HAL_OK;
   uint32_t init_error_step = 0;
@@ -235,15 +241,37 @@ static HAL_StatusTypeDef MotorController_drainI2C(void) {
   return (HAL_I2C_GetState(&hi2c1) == HAL_I2C_STATE_READY) ? HAL_OK : HAL_ERROR;
 }
 
-// Blocking-read one encoder's 12-bit ANGLE register into *raw. Bus must be owned (TIM1 masked + drained).
+// Blocking-read one encoder's 12-bit ANGLE register into *raw. Bus must be owned (TIM1 masked +
+// drained). Glitch-robust: takes ENCODER_BLOCKING_READ_SAMPLES samples and returns the MEDIAN, so
+// a single corrupted sample - including a mid-magnitude bit flip that still passes the in-range
+// check - cannot skew boot resolution or calibration. The shaft is stationary in all callers, so
+// valid samples agree. Fails only if fewer than a majority of samples read back in range.
 static HAL_StatusTypeDef MotorController_readEncoderRaw(Encoder *encoder, uint16_t *raw) {
-  uint8_t buf[2];
-  HAL_StatusTypeDef s = HAL_I2C_Mem_Read(&hi2c1, encoder->i2c_address, AS5600_ANGLE_ADDR,
-                                         I2C_MEMADD_SIZE_8BIT, buf, 2, 10);
-  *raw = (((uint16_t)buf[0]) << 8) | buf[1];
-  if (s != HAL_OK || *raw >= (1U << ENCODER_PRECISION_BITS)) {
+  uint16_t samples[ENCODER_BLOCKING_READ_SAMPLES];
+  uint8_t n = 0;
+  for (uint8_t i = 0; i < ENCODER_BLOCKING_READ_SAMPLES; i += 1) {
+    uint8_t buf[2];
+    if (HAL_I2C_Mem_Read(&hi2c1, encoder->i2c_address, AS5600_ANGLE_ADDR,
+                         I2C_MEMADD_SIZE_8BIT, buf, 2, 10) != HAL_OK) {
+      continue;
+    }
+    uint16_t r = (((uint16_t)buf[0]) << 8) | buf[1];
+    if (r < (1U << ENCODER_PRECISION_BITS)) {
+      samples[n++] = r;
+    }
+  }
+  if (n < (ENCODER_BLOCKING_READ_SAMPLES + 1) / 2) {   // need a majority of valid samples
+    *raw = 0;
     return HAL_ERROR;
   }
+  // insertion sort (n <= 5) then take the median
+  for (uint8_t i = 1; i < n; i += 1) {
+    uint16_t key = samples[i];
+    int8_t j = (int8_t)i - 1;
+    while (j >= 0 && samples[j] > key) { samples[j + 1] = samples[j]; j -= 1; }
+    samples[j + 1] = key;
+  }
+  *raw = samples[n / 2];
   return HAL_OK;
 }
 
@@ -606,20 +634,30 @@ void MotorController_update(MotorController *controller) {
   // if issuing new I2C frame, takes 1.4 us to run (3%)
   // else takes 1.1 us to run (2%)
   HAL_StatusTypeDef status = Encoder_update(&controller->encoder);
+  // last_start_status is the re-arm kickoff result (Encoder_update now re-arms on BOTH the good and
+  // bad-frame paths). Non-OK = hung bus (couldn't start the next read).
+  if (controller->encoder.last_start_status != HAL_OK) {
+    controller->diag_enc_i2c_start_fail_count++;
+  }
   if (status == HAL_OK) {
     controller->diag_enc_ok_count++;
-    // last_start_status is the next-read kickoff result; non-OK = hung bus (stale buffer, frozen
-    // position). Count only - behaviour unchanged (the read still returns the last good value).
-    if (controller->encoder.last_start_status != HAL_OK) {
-      controller->diag_enc_i2c_start_fail_count++;
-    }
+    controller->diag_enc_consecutive_frame_errors = 0;   // a good frame clears the run
   }
   else {
     // Out-of-range frame (raw >= cpr): a corrupted bus read OR bad magnet data (disambiguate via
-    // STATUS/AGC). Existing safety behaviour preserved.
+    // STATUS/AGC). Always counted (true distinct-glitch count - the buffer was re-armed, so this is
+    // not a frozen-buffer spin). Tolerate isolated glitches; only fault after N CONSECUTIVE bad
+    // frames (a real, persistent fault). Any good frame above resets the run. Position holds its
+    // last good value meanwhile (one cycle = 100 us, negligible).
     controller->diag_enc_frame_error_count++;
-    controller->error |= ERROR_ENCODER_FAULT;
-    MotorController_setMode(controller, MODE_DAMPING);
+    controller->diag_enc_consecutive_frame_errors++;
+    if (controller->diag_enc_consecutive_frame_errors > controller->diag_enc_max_consecutive_frame_errors) {
+      controller->diag_enc_max_consecutive_frame_errors = controller->diag_enc_consecutive_frame_errors;
+    }
+    if (controller->diag_enc_consecutive_frame_errors >= ENCODER_FRAME_ERROR_FAULT_THRESHOLD) {
+      controller->error |= ERROR_ENCODER_FAULT;
+      MotorController_setMode(controller, MODE_DAMPING);
+    }
   }
 
   // this block takes 0.5 us to run (1%)

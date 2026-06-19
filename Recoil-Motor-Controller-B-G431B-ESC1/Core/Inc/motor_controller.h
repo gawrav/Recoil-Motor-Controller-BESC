@@ -97,6 +97,9 @@ typedef struct {
   float     diag_psi;                    // last resolution sector residual (~ q*2pi/16)
   float     diag_psi_error;              // last resolution residual to nearest sector centre (rad)
   int32_t   diag_q_raw;                  // last resolution resolved sector (0..15)
+
+  uint32_t  diag_enc_consecutive_frame_errors;     // live run of consecutive bad frames (0 = healthy) @0x5AC
+  uint32_t  diag_enc_max_consecutive_frame_errors; // worst burst seen (high-water; 1 = all isolated) @0x5B0
 } MotorController;
 
 /**

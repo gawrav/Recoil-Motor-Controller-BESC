@@ -57,6 +57,11 @@ HAL_StatusTypeDef Encoder_update(Encoder *encoder) {
   // safety check to handle encoder data frame mismatch error
   uint16_t raw_reading = (((uint16_t)encoder->i2c_buffer[0]) << 8) | encoder->i2c_buffer[1];
   if (raw_reading >= abs(encoder->cpr)) {
+    // Corrupted/out-of-range frame. Re-arm the read so i2c_buffer REFRESHES next cycle instead of
+    // freezing on this garbage (a frozen buffer would wedge the stream until reboot). The caller
+    // counts the bad frame and only faults after N consecutive. Position is left unchanged (the
+    // caller keeps using the last good value for this one cycle).
+    encoder->last_start_status = HAL_I2C_Master_Receive_IT(encoder->hi2c, encoder->i2c_address, encoder->i2c_buffer, 2);
     return 0x04;
   }
 

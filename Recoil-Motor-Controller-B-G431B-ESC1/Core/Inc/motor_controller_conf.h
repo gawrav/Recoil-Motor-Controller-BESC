@@ -112,6 +112,17 @@
 // (isnan alone is not — leftover 0x00000000 reads as float 0.0, not NaN). ASCII "VERN".
 #define VERNIER_CAL_MAGIC               0x5645524EU
 
+// Encoder read-glitch tolerance. A single corrupted/out-of-range primary frame no longer wedges
+// the stream nor instantly faults: Encoder_update re-arms the read so the buffer refreshes, and
+// ENCODER_FAULT/DAMPING is raised only after this many CONSECUTIVE bad 10 kHz frames (a real,
+// persistent fault) - any good frame resets the run. At 10 kHz, 10 frames = 1 ms of stale position.
+#define ENCODER_FRAME_ERROR_FAULT_THRESHOLD   10U
+// Boot/blocking ANGLE reads (resolveAbsolutePosition, calibration) take this many samples and
+// return the MEDIAN, rejecting single-sample glitch outliers - including mid-magnitude bit flips
+// that still pass the in-range check and would otherwise skew boot resolution or calibration.
+// Must be odd. The shaft is stationary in all callers, so the samples should agree.
+#define ENCODER_BLOCKING_READ_SAMPLES         5U
+
 /** ======== Motor Selection ======== **/
 
 #define MOTORPROFILE_MAD_M6C12_150KV
@@ -341,6 +352,8 @@ typedef enum {
   PARAM_DIAG_PSI                                        = 0x5A0U,
   PARAM_DIAG_PSI_ERROR                                  = 0x5A4U,
   PARAM_DIAG_Q_RAW                                      = 0x5A8U,
+  PARAM_DIAG_ENC_CONSEC_FRAME_ERRORS                    = 0x5ACU,  // live consecutive bad-frame run
+  PARAM_DIAG_ENC_MAX_CONSEC_FRAME_ERRORS                = 0x5B0U,  // worst consecutive burst (high-water)
 } Parameter;
 
 
