@@ -328,6 +328,19 @@ typedef enum {
   PARAM_VERNIER_BASE_SECTOR                             = 0x570U,  // calibrated sector origin (read-only)
   PARAM_VERNIER_SECTOR                                  = 0x571U,  // live resolved sector (read-only)
   PARAM_VERNIER_CAL_MAGIC                               = 0x578U,  // == VERNIER_CAL_MAGIC iff calibrated (read-only)
+  // ===== Diagnostics block (RAM-only, read-only; offsets pinned via static_assert) =====
+  PARAM_DIAG_PROBE_WORD                                 = 0x57CU,  // [0]enc probe,[1]enc2 probe,[2]enc STATUS,[3]enc2 STATUS
+  PARAM_DIAG_AGC_WORD                                   = 0x580U,  // [0]enc AGC,[1]enc2 AGC,[2]fail_stage,[3]pad
+  PARAM_DIAG_ENC_OK_COUNT                               = 0x584U,
+  PARAM_DIAG_ENC_FRAME_ERROR_COUNT                      = 0x588U,
+  PARAM_DIAG_ENC_I2C_START_FAIL_COUNT                   = 0x58CU,
+  PARAM_DIAG_ENC_I2C_ERROR_COUNT                        = 0x590U,
+  PARAM_DIAG_ENC_LAST_I2C_ERRORCODE                     = 0x594U,
+  PARAM_DIAG_THETA_P                                    = 0x598U,
+  PARAM_DIAG_THETA_S                                    = 0x59CU,
+  PARAM_DIAG_PSI                                        = 0x5A0U,
+  PARAM_DIAG_PSI_ERROR                                  = 0x5A4U,
+  PARAM_DIAG_Q_RAW                                      = 0x5A8U,
 } Parameter;
 
 

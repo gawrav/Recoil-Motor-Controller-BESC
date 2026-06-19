@@ -67,6 +67,16 @@ void HAL_I2C_MasterRxCpltCallback(I2C_HandleTypeDef *hi2c) {
   // do nothing here
 }
 
+void HAL_I2C_ErrorCallback(I2C_HandleTypeDef *hi2c) {
+  // Count transfer-level I2C errors on the encoder bus and snapshot ErrorCode so the host can
+  // tell addressing faults (AF = NAK) from electrical faults (BERR) from arbitration loss (ARLO).
+  // Count-only: no fault raised / no mode change here (matches the count-only diagnostics design).
+  if (hi2c == &hi2c1) {
+    controller.diag_enc_i2c_error_count++;
+    controller.diag_enc_last_i2c_errorcode = hi2c->ErrorCode;
+  }
+}
+
 /**
  * Procedure following G431 User Manual Section 4.4.2 Option bytes programming
  *

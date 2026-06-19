@@ -26,6 +26,19 @@
 
 
 /**
+ * @brief Last-failure stage recorded by MotorController_resolveAbsolutePosition (diag_last_fail_stage).
+ *        Un-collapses the single ERROR_VERNIER_INCONSISTENT bit for diagnosis over CAN.
+ */
+typedef enum {
+  VERNIER_FAIL_OK             = 0,
+  VERNIER_FAIL_UNCALIBRATED   = 1,
+  VERNIER_FAIL_DRAIN          = 2,
+  VERNIER_FAIL_PRIMARY_READ   = 3,
+  VERNIER_FAIL_SECONDARY_READ = 4,
+  VERNIER_FAIL_PSI_MISMATCH   = 5,
+} VernierFailStage;
+
+/**
  * @brief MotorController object.
  */
 typedef struct {
@@ -55,6 +68,35 @@ typedef struct {
   uint16_t            vernier_sanity_counter;   // deferred runtime sanity check (Phase 2)
   uint16_t            UNUSED_vernier_pad2;      // alignment pad
   uint32_t            vernier_cal_magic;        // == VERNIER_CAL_MAGIC iff genuinely calibrated; persisted
+
+  // ===== Diagnostics block (live telemetry; read-only over SDO) =====
+  // Re-derived every boot, never loaded from flash (loadConfig ignores these; init re-zeroes
+  // them; the whole-page storeConfig serializes the bytes but they are never read back).
+  // Lets the CAN status call separate bus vs magnet vs geometry faults. Offsets pinned via
+  // _Static_assert in motor_controller.c. uint8s packed into 32-bit words because an SDO read
+  // returns a full word. Counters are monotonic (u32, wrap ~every 5 days at 10 kHz) - the host
+  // reads them as deltas/rates, never as absolutes.
+  uint8_t   diag_enc_probe_status;       // primary Encoder_init() HAL status (0 = on bus)        @0x57C
+  uint8_t   diag_enc2_probe_status;      // secondary Encoder_init() HAL status (0 = on bus)
+  uint8_t   diag_enc_status_reg;         // primary STATUS 0x0B (MD/ML/MH); 0xFF = not read
+  uint8_t   diag_enc2_status_reg;        // secondary STATUS 0x0B; 0xFF = not read
+
+  uint8_t   diag_enc_agc;                // primary AGC 0x1A; 0xFF = not read                      @0x580
+  uint8_t   diag_enc2_agc;               // secondary AGC 0x1A; 0xFF = not read
+  uint8_t   diag_last_fail_stage;        // VernierFailStage of the last resolveAbsolutePosition
+  uint8_t   diag_pad0;                   // alignment
+
+  uint32_t  diag_enc_ok_count;            // primary Encoder_update HAL_OK count (10 kHz)          @0x584
+  uint32_t  diag_enc_frame_error_count;   // primary out-of-range frames (raw >= cpr)
+  uint32_t  diag_enc_i2c_start_fail_count;// primary Master_Receive_IT kickoff failures (hung bus)
+  uint32_t  diag_enc_i2c_error_count;     // I2C transfer errors (HAL_I2C_ErrorCallback)
+  uint32_t  diag_enc_last_i2c_errorcode;  // last hi2c1->ErrorCode (AF/BERR/ARLO/...)
+
+  float     diag_theta_p;                // last resolution primary angle [0,2pi)                  @0x598
+  float     diag_theta_s;                // last resolution secondary angle [0,2pi) (SIGN applied)
+  float     diag_psi;                    // last resolution sector residual (~ q*2pi/16)
+  float     diag_psi_error;              // last resolution residual to nearest sector centre (rad)
+  int32_t   diag_q_raw;                  // last resolution resolved sector (0..15)
 } MotorController;
 
 /**

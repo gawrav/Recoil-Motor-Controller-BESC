@@ -21,6 +21,7 @@ HAL_StatusTypeDef Encoder_init(Encoder *encoder, I2C_HandleTypeDef *hi2c, uint16
 
   encoder->position_raw = 0;
   encoder->n_rotations = 0;
+  encoder->last_start_status = HAL_OK;
 
   encoder->position = 0.f;
   encoder->velocity = 0.f;
@@ -61,8 +62,9 @@ HAL_StatusTypeDef Encoder_update(Encoder *encoder) {
 
   // TODO: implement encoder lut-table Linearization
 
-  // I2C takes ~77.75 us (12.86 kHz) to finish one transaction
-  HAL_I2C_Master_Receive_IT(encoder->hi2c, encoder->i2c_address, encoder->i2c_buffer, 2);
+  // I2C takes ~77.75 us (12.86 kHz) to finish one transaction. Capture the kickoff status so the
+  // caller can count hung-bus events (HAL_BUSY/HAL_ERROR = next read never started -> stale buffer).
+  encoder->last_start_status = HAL_I2C_Master_Receive_IT(encoder->hi2c, encoder->i2c_address, encoder->i2c_buffer, 2);
 
 
   // Calculate the change in reading

@@ -23,6 +23,26 @@ _Static_assert(offsetof(MotorController, vernier_sector) == PARAM_VERNIER_SECTOR
                "PARAM_VERNIER_SECTOR mismatch");
 _Static_assert(offsetof(MotorController, vernier_cal_magic) == PARAM_VERNIER_CAL_MAGIC,
                "PARAM_VERNIER_CAL_MAGIC mismatch");
+// Diagnostics block (read-only telemetry). Pin every word the host reads.
+_Static_assert(offsetof(MotorController, diag_enc_probe_status) == PARAM_DIAG_PROBE_WORD,
+               "PARAM_DIAG_PROBE_WORD mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_agc) == PARAM_DIAG_AGC_WORD,
+               "PARAM_DIAG_AGC_WORD mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_ok_count) == PARAM_DIAG_ENC_OK_COUNT,
+               "PARAM_DIAG_ENC_OK_COUNT mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_frame_error_count) == PARAM_DIAG_ENC_FRAME_ERROR_COUNT,
+               "PARAM_DIAG_ENC_FRAME_ERROR_COUNT mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_i2c_start_fail_count) == PARAM_DIAG_ENC_I2C_START_FAIL_COUNT,
+               "PARAM_DIAG_ENC_I2C_START_FAIL_COUNT mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_i2c_error_count) == PARAM_DIAG_ENC_I2C_ERROR_COUNT,
+               "PARAM_DIAG_ENC_I2C_ERROR_COUNT mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_last_i2c_errorcode) == PARAM_DIAG_ENC_LAST_I2C_ERRORCODE,
+               "PARAM_DIAG_ENC_LAST_I2C_ERRORCODE mismatch");
+_Static_assert(offsetof(MotorController, diag_theta_p) == PARAM_DIAG_THETA_P, "PARAM_DIAG_THETA_P mismatch");
+_Static_assert(offsetof(MotorController, diag_theta_s) == PARAM_DIAG_THETA_S, "PARAM_DIAG_THETA_S mismatch");
+_Static_assert(offsetof(MotorController, diag_psi) == PARAM_DIAG_PSI, "PARAM_DIAG_PSI mismatch");
+_Static_assert(offsetof(MotorController, diag_psi_error) == PARAM_DIAG_PSI_ERROR, "PARAM_DIAG_PSI_ERROR mismatch");
+_Static_assert(offsetof(MotorController, diag_q_raw) == PARAM_DIAG_Q_RAW, "PARAM_DIAG_Q_RAW mismatch");
 _Static_assert(sizeof(MotorController) <= FLASH_PAGE_SIZE,
                "MotorController no longer fits in one Flash page");
 // Existing primary encoder offset must not have shifted (regression guard for review M-4):
@@ -43,6 +63,11 @@ extern ADC_HandleTypeDef hadc1;
 extern ADC_HandleTypeDef hadc2;
 extern FDCAN_HandleTypeDef hfdcan1;
 extern I2C_HandleTypeDef hi2c1;
+
+// Blocking read of one 8-bit encoder register (STATUS/AGC); used by boot diagnostics. Defined below.
+static HAL_StatusTypeDef MotorController_readEncoderReg(Encoder *encoder, uint8_t reg, uint8_t *out);
+// Capture each encoder's STATUS (0x0B) + AGC (0x1A) into the diag block (sentinels if not on bus).
+static void MotorController_captureEncoderHealth(MotorController *controller);
 extern OPAMP_HandleTypeDef hopamp1;
 extern OPAMP_HandleTypeDef hopamp2;
 extern OPAMP_HandleTypeDef hopamp3;
@@ -73,6 +98,28 @@ void MotorController_init(MotorController *controller) {
   controller->vernier_sanity_counter = 0;
   controller->vernier_cal_magic    = 0;   // 0 = uncalibrated until loadConfig/calibration says otherwise
 
+  // Diagnostics block defaults (RAM-only telemetry). 0xFF = "not read yet" sentinel for the
+  // status/probe bytes so a real 0 (HAL_OK / valid reg) is never confused with the uninitialised
+  // state. Counters left at 0 (the host reads them as deltas).
+  controller->diag_enc_probe_status  = 0xFF;
+  controller->diag_enc2_probe_status = 0xFF;
+  controller->diag_enc_status_reg    = 0xFF;
+  controller->diag_enc2_status_reg   = 0xFF;
+  controller->diag_enc_agc           = 0xFF;
+  controller->diag_enc2_agc          = 0xFF;
+  controller->diag_last_fail_stage   = VERNIER_FAIL_OK;
+  controller->diag_pad0              = 0;
+  controller->diag_enc_ok_count             = 0;
+  controller->diag_enc_frame_error_count    = 0;
+  controller->diag_enc_i2c_start_fail_count = 0;
+  controller->diag_enc_i2c_error_count      = 0;
+  controller->diag_enc_last_i2c_errorcode   = 0;
+  controller->diag_theta_p = 0.f;
+  controller->diag_theta_s = 0.f;
+  controller->diag_psi = 0.f;
+  controller->diag_psi_error = 0.f;
+  controller->diag_q_raw = 0;
+
   HAL_StatusTypeDef status = HAL_OK;
   uint32_t init_error_step = 0;
 
@@ -80,12 +127,19 @@ void MotorController_init(MotorController *controller) {
   status |= CAN_init(&hfdcan1, 0, 0);
   if (status && !init_error_step) init_error_step = 1;
 
-  status |= Encoder_init(&controller->encoder, &hi2c1, AS5600_I2C_ADDR, 1);  // primary: init the shared bus
+  HAL_StatusTypeDef enc_status = Encoder_init(&controller->encoder, &hi2c1, AS5600_I2C_ADDR, 1);  // primary: init the shared bus
+  controller->diag_enc_probe_status = (uint8_t)enc_status;
+  status |= enc_status;
   if (status && !init_error_step) init_error_step = 2;
   // Secondary AS5600L on the SAME bus (init_bus=0, don't re-init the peripheral). A missing/dead
   // secondary must NOT trigger the hard init-error loop — keep its status out of `status` so boot
-  // proceeds and vernier resolution fails closed (MODE_DISABLED) instead.
-  (void)Encoder_init(&controller->encoder_secondary, &hi2c1, AS5600L_I2C_ADDR_SECONDARY, 0);
+  // proceeds and vernier resolution fails closed (MODE_DISABLED) instead. Its probe result is
+  // captured (not discarded) so the host can tell whether the secondary is even on the bus.
+  controller->diag_enc2_probe_status = (uint8_t)Encoder_init(&controller->encoder_secondary, &hi2c1, AS5600L_I2C_ADDR_SECONDARY, 0);
+  // Boot magnet health (STATUS/AGC) for both encoders. The TIM1 ISR is not started until
+  // PowerStage_start below, so the bus is ours here. This runs before the init-error trap, so a
+  // wedged board (0x2064) still reports per-encoder presence + magnet health over CAN.
+  MotorController_captureEncoderHealth(controller);
   status |= PowerStage_init(&controller->powerstage, &htim1, &hadc1, &hadc2);
   if (status && !init_error_step) init_error_step = 3;
   status |= Motor_init(&controller->motor);
@@ -200,12 +254,28 @@ static inline float MotorController_secondaryAngle(uint16_t raw_s, int32_t cpr) 
   return wrapTo2Pi((float)VERNIER_SECONDARY_SIGN * a);
 }
 
+// Blocking read of one 8-bit encoder register (e.g. STATUS 0x0B, AGC 0x1A). Bus must be owned.
+static HAL_StatusTypeDef MotorController_readEncoderReg(Encoder *encoder, uint8_t reg, uint8_t *out) {
+  return HAL_I2C_Mem_Read(&hi2c1, encoder->i2c_address, reg, I2C_MEMADD_SIZE_8BIT, out, 1, 10);
+}
+
+// Read STATUS (0x0B) + AGC (0x1A) for both encoders into the diag block; 0xFF on a failed read
+// (absent/dead device). Blocking - call only de-energized (boot/init or ISR-masked resolution).
+static void MotorController_captureEncoderHealth(MotorController *controller) {
+  uint8_t reg;
+  controller->diag_enc_status_reg  = (MotorController_readEncoderReg(&controller->encoder, AS5600_STATUS_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
+  controller->diag_enc_agc         = (MotorController_readEncoderReg(&controller->encoder, AS5600_AGC_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
+  controller->diag_enc2_status_reg = (MotorController_readEncoderReg(&controller->encoder_secondary, AS5600_STATUS_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
+  controller->diag_enc2_agc        = (MotorController_readEncoderReg(&controller->encoder_secondary, AS5600_AGC_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
+}
+
 HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *controller) {
   // Uncalibrated unit -> fail closed; requires MODE_VERNIER_CALIBRATION.
   // The magic word is the primary gate: it is robust against stale/zeroed/erased flash that an
   // isnan-only check would mistake for a valid zero calibration. isnan kept as a belt-and-suspenders
   // guard against a corrupted-but-magic-matching record.
   if (controller->vernier_cal_magic != VERNIER_CAL_MAGIC || isnan(controller->vernier_phase_offset)) {
+    controller->diag_last_fail_stage = VERNIER_FAIL_UNCALIBRATED;
     SET_BITS(controller->error, ERROR_VERNIER_CALIBRATION_FAILED);
     return HAL_ERROR;
   }
@@ -214,12 +284,23 @@ HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *contr
   // can't be preempted/raced. Then drain any in-flight IT receive (review C-1).
   __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
 
+  // Read each stage separately so diag_last_fail_stage records exactly which one failed (the host
+  // can then tell a bus failure from a geometry mismatch instead of one opaque INCONSISTENT bit).
   uint16_t theta_p_raw = 0, theta_s_raw = 0;
-  HAL_StatusTypeDef status = MotorController_drainI2C();
-  if (status == HAL_OK) status = MotorController_readEncoderRaw(&controller->encoder, &theta_p_raw);
-  if (status == HAL_OK) status = MotorController_readEncoderRaw(&controller->encoder_secondary, &theta_s_raw);
-
-  if (status != HAL_OK) {
+  if (MotorController_drainI2C() != HAL_OK) {
+    controller->diag_last_fail_stage = VERNIER_FAIL_DRAIN;
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+    SET_BITS(controller->error, ERROR_VERNIER_INCONSISTENT);
+    return HAL_ERROR;
+  }
+  if (MotorController_readEncoderRaw(&controller->encoder, &theta_p_raw) != HAL_OK) {
+    controller->diag_last_fail_stage = VERNIER_FAIL_PRIMARY_READ;
+    __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
+    SET_BITS(controller->error, ERROR_VERNIER_INCONSISTENT);
+    return HAL_ERROR;
+  }
+  if (MotorController_readEncoderRaw(&controller->encoder_secondary, &theta_s_raw) != HAL_OK) {
+    controller->diag_last_fail_stage = VERNIER_FAIL_SECONDARY_READ;
     __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
     SET_BITS(controller->error, ERROR_VERNIER_INCONSISTENT);
     return HAL_ERROR;
@@ -234,9 +315,21 @@ HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *contr
   int32_t q_raw = lroundf(psi * (float)VERNIER_SECTORS / M_2PI_F);
   q_raw = ((q_raw % VERNIER_SECTORS) + VERNIER_SECTORS) % VERNIER_SECTORS;
 
-  // Consistency check: residual to the nearest sector centre must be small, else fail closed.
   float psi_expected = (float)q_raw * (M_2PI_F / (float)VERNIER_SECTORS);
-  if (fabsf(wrapToPi(psi - psi_expected)) > deg2rad(5.0f)) {
+  float psi_error = wrapToPi(psi - psi_expected);
+
+  // Capture resolution intermediates + fresh magnet health (both encoders confirmed present here).
+  // Recorded even when the consistency check below fails, so the host sees why it failed.
+  controller->diag_theta_p   = theta_p;
+  controller->diag_theta_s   = theta_s;
+  controller->diag_psi       = psi;
+  controller->diag_psi_error = psi_error;
+  controller->diag_q_raw     = q_raw;
+  MotorController_captureEncoderHealth(controller);
+
+  // Consistency check: residual to the nearest sector centre must be small, else fail closed.
+  if (fabsf(psi_error) > deg2rad(5.0f)) {
+    controller->diag_last_fail_stage = VERNIER_FAIL_PSI_MISMATCH;
     __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
     SET_BITS(controller->error, ERROR_VERNIER_INCONSISTENT);
     return HAL_ERROR;
@@ -256,6 +349,7 @@ HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *contr
   controller->encoder.position     = theta_p + (float)n_rot * M_2PI_F;
   controller->vernier_sector       = (uint8_t)q_raw;
   controller->vernier_initialized  = 1;
+  controller->diag_last_fail_stage = VERNIER_FAIL_OK;
 
   __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
   return HAL_OK;
@@ -503,7 +597,18 @@ void MotorController_update(MotorController *controller) {
   // if issuing new I2C frame, takes 1.4 us to run (3%)
   // else takes 1.1 us to run (2%)
   HAL_StatusTypeDef status = Encoder_update(&controller->encoder);
-  if (status != HAL_OK) {
+  if (status == HAL_OK) {
+    controller->diag_enc_ok_count++;
+    // last_start_status is the next-read kickoff result; non-OK = hung bus (stale buffer, frozen
+    // position). Count only - behaviour unchanged (the read still returns the last good value).
+    if (controller->encoder.last_start_status != HAL_OK) {
+      controller->diag_enc_i2c_start_fail_count++;
+    }
+  }
+  else {
+    // Out-of-range frame (raw >= cpr): a corrupted bus read OR bad magnet data (disambiguate via
+    // STATUS/AGC). Existing safety behaviour preserved.
+    controller->diag_enc_frame_error_count++;
     controller->error |= ERROR_ENCODER_FAULT;
     MotorController_setMode(controller, MODE_DAMPING);
   }

@@ -33,6 +33,7 @@ Requires:  pip install python-can   (+ gs_usb pyusb and libusb for the gs_usb ba
 """
 
 import argparse
+import math
 import struct
 import sys
 import time
@@ -111,7 +112,65 @@ PARAMS = {
     # vernier_base_sector (u8 @0x570) and vernier_sector (u8 @0x571) share one word:
     "vernier_status_word":  (0x570, "u32"),
     "vernier_cal_magic":    (0x578, "u32"),
+    # ---- Diagnostics block (RAM-only, read-only). Packed words decoded in cmd_diag. ----
+    # diag_probe_word: [0]=enc probe,[1]=enc2 probe,[2]=enc STATUS,[3]=enc2 STATUS
+    "diag_probe_word":       (0x57C, "u32"),
+    # diag_agc_word:   [0]=enc AGC,[1]=enc2 AGC,[2]=fail_stage,[3]=pad
+    "diag_agc_word":         (0x580, "u32"),
+    "diag_ok_count":         (0x584, "u32"),
+    "diag_frame_err_count":  (0x588, "u32"),
+    "diag_start_fail_count": (0x58C, "u32"),
+    "diag_i2c_err_count":    (0x590, "u32"),
+    "diag_last_i2c_errcode": (0x594, "u32"),
+    "diag_theta_p":          (0x598, "f32"),
+    "diag_theta_s":          (0x59C, "f32"),
+    "diag_psi":              (0x5A0, "f32"),
+    "diag_psi_error":        (0x5A4, "f32"),
+    "diag_q_raw":            (0x5A8, "i32"),
 }
+
+# AS5600/AS5600L STATUS reg 0x0B: MD=detected (good), ML=too weak, MH=too strong.
+STATUS_BITS = {0x20: "MD", 0x10: "ML", 0x08: "MH"}
+# STM32 HAL I2C ErrorCode bits.
+I2C_ERR_BITS = {0x01: "BERR", 0x02: "ARLO", 0x04: "AF", 0x08: "OVR",
+                0x10: "DMA", 0x20: "TIMEOUT", 0x40: "SIZE"}
+FAIL_STAGE_NAMES = {0: "OK", 1: "UNCALIBRATED", 2: "DRAIN",
+                    3: "PRIMARY_READ", 4: "SECONDARY_READ", 5: "PSI_MISMATCH"}
+
+
+def fmt_probe(b):
+    if b == 0xFF:
+        return "not-read"
+    return "on-bus" if b == 0 else f"FAIL(0x{b:02X})"
+
+
+def fmt_status_reg(b):
+    if b == 0xFF:
+        return "not-read"
+    flags = [name for mask, name in STATUS_BITS.items() if b & mask]
+    healthy = (b & 0x20) and not (b & 0x10) and not (b & 0x08)  # MD set, ML/MH clear
+    return f"0x{b:02X} [{'|'.join(flags) or 'none'}] {'ok' if healthy else 'BAD'}"
+
+
+def fmt_agc(b):
+    if b == 0xFF:
+        return "not-read"
+    # AGC range is 0-255 at 5V (this board powers the encoders at 5V); it would be 0-128 at 3.3V,
+    # in which case halve these thresholds. Mid-range ideal; rails => airgap out of range.
+    if b <= 32:
+        hint = "LOW: magnet too close/strong"
+    elif b >= 224:
+        hint = "HIGH: magnet too far/weak"
+    else:
+        hint = "centered"
+    return f"{b} ({hint})"
+
+
+def fmt_i2c_errcode(v):
+    if v == 0:
+        return "NONE"
+    bits = [name for mask, name in I2C_ERR_BITS.items() if v & mask]
+    return f"0x{v:02X} (" + "|".join(bits) + ")"
 
 VERNIER_CAL_MAGIC = 0x5645524E   # "VERN"; == means genuinely calibrated
 
@@ -259,6 +318,37 @@ def cmd_status(dev):
     print(f"  arm pos raw: {pm:+.5f} rad (absolute, no offset)")
     print(f"  position_offset: {off:+.5f} rad")
     print(f"  arm pos:     {pm - off:+.5f} rad (zeroed = host/PDO frame)")
+    print("  --- encoder diagnostics ---")
+    print_diag(dev, indent="  ")
+
+
+def print_diag(dev, indent=""):
+    probe = int(dev.read("diag_probe_word"))
+    agcw = int(dev.read("diag_agc_word"))
+    enc_probe   = probe & 0xFF
+    enc2_probe  = (probe >> 8) & 0xFF
+    enc_status  = (probe >> 16) & 0xFF
+    enc2_status = (probe >> 24) & 0xFF
+    enc_agc     = agcw & 0xFF
+    enc2_agc    = (agcw >> 8) & 0xFF
+    fail_stage  = (agcw >> 16) & 0xFF
+    print(f"{indent}primary  : {fmt_probe(enc_probe)}  status={fmt_status_reg(enc_status)}  agc={fmt_agc(enc_agc)}")
+    print(f"{indent}secondary: {fmt_probe(enc2_probe)}  status={fmt_status_reg(enc2_status)}  agc={fmt_agc(enc2_agc)}")
+    print(f"{indent}resolve  : fail_stage={FAIL_STAGE_NAMES.get(fail_stage, fail_stage)}  "
+          f"q_raw={int(dev.read('diag_q_raw'))}  psi_err={math.degrees(dev.read('diag_psi_error')):+.2f} deg")
+    print(f"{indent}           theta_p={dev.read('diag_theta_p'):+.4f}  theta_s={dev.read('diag_theta_s'):+.4f}  "
+          f"psi={dev.read('diag_psi'):+.4f} rad")
+    # Counters are absolute (wrap ~5 days @10kHz); poll twice for a rate.
+    print(f"{indent}primary live: ok={int(dev.read('diag_ok_count'))}  "
+          f"frame_err={int(dev.read('diag_frame_err_count'))}  "
+          f"start_fail={int(dev.read('diag_start_fail_count'))}  "
+          f"i2c_err={int(dev.read('diag_i2c_err_count'))}  "
+          f"last_i2c={fmt_i2c_errcode(int(dev.read('diag_last_i2c_errcode')))}")
+
+
+def cmd_diag(dev):
+    print("Encoder diagnostics:")
+    print_diag(dev, indent="  ")
 
 
 def cmd_monitor(dev, period):
@@ -306,6 +396,7 @@ def main():
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="dump key params once")
+    sub.add_parser("diag", help="dump encoder bus/magnet/geometry diagnostics")
     sub.add_parser("discover", help="find device id(s) on the bus via broadcast SDO")
 
     pm = sub.add_parser("monitor", help="poll key params continuously")
@@ -337,6 +428,8 @@ def main():
     try:
         if args.cmd == "status":
             cmd_status(dev)
+        elif args.cmd == "diag":
+            cmd_diag(dev)
         elif args.cmd == "discover":
             found = dev.discover()
             if not found:

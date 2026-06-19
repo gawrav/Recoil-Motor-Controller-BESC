@@ -41,7 +41,8 @@ typedef struct {
   I2C_HandleTypeDef *hi2c;
 
   uint8_t   i2c_buffer[2];
-  uint8_t   UNUSED_0[2];
+  uint8_t   last_start_status;  // HAL status of the last Master_Receive_IT kickoff (repurposed from UNUSED_0)
+  uint8_t   UNUSED_0;
 
   uint16_t  i2c_address;  // already-shifted 7-bit addr (addr << 1); repurposed from UNUSED_1
   uint8_t   UNUSED_2[2];
