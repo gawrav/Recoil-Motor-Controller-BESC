@@ -100,6 +100,8 @@ typedef struct {
 
   uint32_t  diag_enc_consecutive_frame_errors;     // live run of consecutive bad frames (0 = healthy) @0x5AC
   uint32_t  diag_enc_max_consecutive_frame_errors; // worst burst seen (high-water; 1 = all isolated) @0x5B0
+  uint16_t  diag_enc_boot_read_errors;             // primary  bad reads out of ENCODER_BOOT_INTEGRITY_SAMPLES @0x5B4
+  uint16_t  diag_enc2_boot_read_errors;            // secondary bad reads out of ENCODER_BOOT_INTEGRITY_SAMPLES @0x5B6
 } MotorController;
 
 /**

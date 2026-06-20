@@ -122,6 +122,10 @@
 // that still pass the in-range check and would otherwise skew boot resolution or calibration.
 // Must be odd. The shaft is stationary in all callers, so the samples should agree.
 #define ENCODER_BLOCKING_READ_SAMPLES         5U
+// Boot read-integrity burst: at boot (de-energized) each encoder is read this many times and the
+// out-of-range/NAK count is recorded per encoder (diag_enc*_boot_read_errors). Gives an apples-to-
+// apples per-encoder glitch rate so primary vs secondary read health can be compared directly.
+#define ENCODER_BOOT_INTEGRITY_SAMPLES        64U
 
 /** ======== Motor Selection ======== **/
 
@@ -354,6 +358,7 @@ typedef enum {
   PARAM_DIAG_Q_RAW                                      = 0x5A8U,
   PARAM_DIAG_ENC_CONSEC_FRAME_ERRORS                    = 0x5ACU,  // live consecutive bad-frame run
   PARAM_DIAG_ENC_MAX_CONSEC_FRAME_ERRORS                = 0x5B0U,  // worst consecutive burst (high-water)
+  PARAM_DIAG_BOOT_READ_ERRORS                           = 0x5B4U,  // [15:0]=primary bad, [31:16]=secondary bad (of ENCODER_BOOT_INTEGRITY_SAMPLES)
 } Parameter;
 
 

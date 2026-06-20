@@ -47,6 +47,10 @@ _Static_assert(offsetof(MotorController, diag_enc_consecutive_frame_errors) == P
                "PARAM_DIAG_ENC_CONSEC_FRAME_ERRORS mismatch");
 _Static_assert(offsetof(MotorController, diag_enc_max_consecutive_frame_errors) == PARAM_DIAG_ENC_MAX_CONSEC_FRAME_ERRORS,
                "PARAM_DIAG_ENC_MAX_CONSEC_FRAME_ERRORS mismatch");
+_Static_assert(offsetof(MotorController, diag_enc_boot_read_errors) == PARAM_DIAG_BOOT_READ_ERRORS,
+               "PARAM_DIAG_BOOT_READ_ERRORS mismatch");
+_Static_assert(offsetof(MotorController, diag_enc2_boot_read_errors) == PARAM_DIAG_BOOT_READ_ERRORS + 2,
+               "diag_enc2_boot_read_errors must pack into the high half of PARAM_DIAG_BOOT_READ_ERRORS");
 _Static_assert(sizeof(MotorController) <= FLASH_PAGE_SIZE,
                "MotorController no longer fits in one Flash page");
 // Existing primary encoder offset must not have shifted (regression guard for review M-4):
@@ -72,6 +76,8 @@ extern I2C_HandleTypeDef hi2c1;
 static HAL_StatusTypeDef MotorController_readEncoderReg(Encoder *encoder, uint8_t reg, uint8_t *out);
 // Capture each encoder's STATUS (0x0B) + AGC (0x1A) into the diag block (sentinels if not on bus).
 static void MotorController_captureEncoderHealth(MotorController *controller);
+// Boot read-integrity burst: count bad reads per encoder so primary vs secondary can be compared.
+static void MotorController_measureEncoderReadIntegrity(MotorController *controller);
 extern OPAMP_HandleTypeDef hopamp1;
 extern OPAMP_HandleTypeDef hopamp2;
 extern OPAMP_HandleTypeDef hopamp3;
@@ -125,6 +131,8 @@ void MotorController_init(MotorController *controller) {
   controller->diag_q_raw = 0;
   controller->diag_enc_consecutive_frame_errors     = 0;
   controller->diag_enc_max_consecutive_frame_errors = 0;
+  controller->diag_enc_boot_read_errors             = 0;
+  controller->diag_enc2_boot_read_errors            = 0;
 
   HAL_StatusTypeDef status = HAL_OK;
   uint32_t init_error_step = 0;
@@ -142,9 +150,12 @@ void MotorController_init(MotorController *controller) {
   // proceeds and vernier resolution fails closed (MODE_DISABLED) instead. Its probe result is
   // captured (not discarded) so the host can tell whether the secondary is even on the bus.
   controller->diag_enc2_probe_status = (uint8_t)Encoder_init(&controller->encoder_secondary, &hi2c1, AS5600L_I2C_ADDR_SECONDARY, 0);
-  // Boot magnet health (STATUS/AGC) for both encoders. The TIM1 ISR is not started until
-  // PowerStage_start below, so the bus is ours here. This runs before the init-error trap, so a
-  // wedged board (0x2064) still reports per-encoder presence + magnet health over CAN.
+  // Per-encoder boot read-integrity burst (both encoders, unconditionally) + magnet health. The
+  // TIM1 ISR is not started until PowerStage_start below, so the bus is ours here. Runs before the
+  // init-error trap, so a wedged board still reports per-encoder glitch rates + magnet health over
+  // CAN. The integrity burst runs first; captureEncoderHealth's re-prime then leaves the primary's
+  // pointer/buffer ready for streaming.
+  MotorController_measureEncoderReadIntegrity(controller);
   MotorController_captureEncoderHealth(controller);
   status |= PowerStage_init(&controller->powerstage, &htim1, &hadc1, &hadc2);
   if (status && !init_error_step) init_error_step = 3;
@@ -304,6 +315,33 @@ static void MotorController_captureEncoderHealth(MotorController *controller) {
   // secondary is never streamed (resolve always addresses it explicitly), so it needs no re-prime.
   HAL_I2C_Mem_Read(&hi2c1, controller->encoder.i2c_address, AS5600_ANGLE_ADDR,
                    I2C_MEMADD_SIZE_8BIT, controller->encoder.i2c_buffer, 2, 10);
+}
+
+// Count out-of-range / failed ANGLE reads over a fixed burst (boot read-integrity probe). Each read
+// is an addressed Mem_Read of ANGLE, so the register pointer is left at ANGLE afterwards.
+static uint16_t MotorController_countBadReads(Encoder *encoder) {
+  uint16_t bad = 0;
+  for (uint16_t i = 0; i < ENCODER_BOOT_INTEGRITY_SAMPLES; i += 1) {
+    uint8_t buf[2];
+    if (HAL_I2C_Mem_Read(&hi2c1, encoder->i2c_address, AS5600_ANGLE_ADDR,
+                         I2C_MEMADD_SIZE_8BIT, buf, 2, 10) != HAL_OK) {
+      bad += 1;
+      continue;
+    }
+    uint16_t r = (((uint16_t)buf[0]) << 8) | buf[1];
+    if (r >= (1U << ENCODER_PRECISION_BITS)) {
+      bad += 1;
+    }
+  }
+  return bad;
+}
+
+// Boot read-integrity burst for BOTH encoders (unconditionally - not short-circuited), giving an
+// apples-to-apples per-encoder glitch rate so primary vs secondary read health can be compared.
+// Call only de-energized with the bus idle (boot, before PowerStage_start / streaming).
+static void MotorController_measureEncoderReadIntegrity(MotorController *controller) {
+  controller->diag_enc_boot_read_errors  = MotorController_countBadReads(&controller->encoder);
+  controller->diag_enc2_boot_read_errors = MotorController_countBadReads(&controller->encoder_secondary);
 }
 
 HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *controller) {

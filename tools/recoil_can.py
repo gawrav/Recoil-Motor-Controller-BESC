@@ -129,7 +129,12 @@ PARAMS = {
     "diag_q_raw":            (0x5A8, "i32"),
     "diag_consec_frame_err":     (0x5AC, "u32"),
     "diag_max_consec_frame_err": (0x5B0, "u32"),
+    # [15:0]=primary bad reads, [31:16]=secondary bad reads, of ENC_BOOT_INTEGRITY_SAMPLES:
+    "diag_boot_read_errors":     (0x5B4, "u32"),
 }
+
+# Must match ENCODER_BOOT_INTEGRITY_SAMPLES in motor_controller_conf.h.
+ENC_BOOT_INTEGRITY_SAMPLES = 64
 
 # AS5600/AS5600L STATUS reg 0x0B: MD=detected (good), ML=too weak, MH=too strong.
 STATUS_BITS = {0x20: "MD", 0x10: "ML", 0x08: "MH"}
@@ -336,6 +341,9 @@ def print_diag(dev, indent=""):
     fail_stage  = (agcw >> 16) & 0xFF
     print(f"{indent}primary  : {fmt_probe(enc_probe)}  status={fmt_status_reg(enc_status)}  agc={fmt_agc(enc_agc)}")
     print(f"{indent}secondary: {fmt_probe(enc2_probe)}  status={fmt_status_reg(enc2_status)}  agc={fmt_agc(enc2_agc)}")
+    bre = int(dev.read("diag_boot_read_errors"))
+    n = ENC_BOOT_INTEGRITY_SAMPLES
+    print(f"{indent}boot read errors: primary={bre & 0xFFFF}/{n}  secondary={(bre >> 16) & 0xFFFF}/{n}")
     print(f"{indent}resolve  : fail_stage={FAIL_STAGE_NAMES.get(fail_stage, fail_stage)}  "
           f"q_raw={int(dev.read('diag_q_raw'))}  psi_err={math.degrees(dev.read('diag_psi_error')):+.2f} deg")
     print(f"{indent}           theta_p={dev.read('diag_theta_p'):+.4f}  theta_s={dev.read('diag_theta_s'):+.4f}  "
