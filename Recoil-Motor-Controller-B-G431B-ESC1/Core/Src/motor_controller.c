@@ -145,11 +145,13 @@ void MotorController_init(MotorController *controller) {
   controller->diag_enc_probe_status = (uint8_t)enc_status;
   status |= enc_status;
   if (status && !init_error_step) init_error_step = 2;
+#if VERNIER_ENABLED
   // Secondary AS5600L on the SAME bus (init_bus=0, don't re-init the peripheral). A missing/dead
   // secondary must NOT trigger the hard init-error loop — keep its status out of `status` so boot
   // proceeds and vernier resolution fails closed (MODE_DISABLED) instead. Its probe result is
   // captured (not discarded) so the host can tell whether the secondary is even on the bus.
   controller->diag_enc2_probe_status = (uint8_t)Encoder_init(&controller->encoder_secondary, &hi2c1, AS5600L_I2C_ADDR_SECONDARY, 0);
+#endif
   // Per-encoder boot read-integrity burst (both encoders, unconditionally) + magnet health. The
   // TIM1 ISR is not started until PowerStage_start below, so the bus is ours here. Runs before the
   // init-error trap, so a wedged board still reports per-encoder glitch rates + magnet health over
@@ -230,6 +232,7 @@ void MotorController_init(MotorController *controller) {
   // clear init-phase errors before resolving (so a resolution error survives — review pass 3)
   MotorController_clearError(controller);
 
+#if VERNIER_ENABLED
   // Resolve absolute arm position from the vernier. Fail closed: only go operational (MODE_IDLE)
   // if resolution succeeds; otherwise stay MODE_DISABLED with the error set, requiring either a
   // fix or MODE_VERNIER_CALIBRATION. (The unconditional setMode(MODE_IDLE) is now guarded.)
@@ -237,6 +240,11 @@ void MotorController_init(MotorController *controller) {
     MotorController_setMode(controller, MODE_IDLE);
   }
   // else: ERROR_VERNIER_INCONSISTENT / ERROR_VERNIER_CALIBRATION_FAILED already set; remain MODE_DISABLED.
+#else
+  // Single-encoder build: no absolute resolution. Boot straight to IDLE with relative multi-turn
+  // position (n_rotations = 0 at power-up), exactly like the original pre-vernier firmware.
+  MotorController_setMode(controller, MODE_IDLE);
+#endif
 }
 
 // Drain any in-flight interrupt-driven I2C receive so a subsequent blocking read won't get HAL_BUSY.
@@ -304,8 +312,10 @@ static void MotorController_captureEncoderHealth(MotorController *controller) {
   uint8_t reg;
   controller->diag_enc_status_reg  = (MotorController_readEncoderReg(&controller->encoder, AS5600_STATUS_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
   controller->diag_enc_agc         = (MotorController_readEncoderReg(&controller->encoder, AS5600_AGC_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
+#if VERNIER_ENABLED
   controller->diag_enc2_status_reg = (MotorController_readEncoderReg(&controller->encoder_secondary, AS5600_STATUS_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
   controller->diag_enc2_agc        = (MotorController_readEncoderReg(&controller->encoder_secondary, AS5600_AGC_ADDR, &reg) == HAL_OK) ? reg : 0xFF;
+#endif
 
   // CRITICAL: the STATUS/AGC reads above moved the AS5600 register pointer off ANGLE. The 10 kHz
   // streaming read (Encoder_update -> HAL_I2C_Master_Receive_IT) reads 2 bytes from the CURRENT
@@ -341,7 +351,9 @@ static uint16_t MotorController_countBadReads(Encoder *encoder) {
 // Call only de-energized with the bus idle (boot, before PowerStage_start / streaming).
 static void MotorController_measureEncoderReadIntegrity(MotorController *controller) {
   controller->diag_enc_boot_read_errors  = MotorController_countBadReads(&controller->encoder);
+#if VERNIER_ENABLED
   controller->diag_enc2_boot_read_errors = MotorController_countBadReads(&controller->encoder_secondary);
+#endif
 }
 
 HAL_StatusTypeDef MotorController_resolveAbsolutePosition(MotorController *controller) {
@@ -798,10 +810,12 @@ void MotorController_updateService(MotorController *controller) {
     MotorController_runCalibrationSequence(controller);
     return;
   }
+#if VERNIER_ENABLED
   if (controller->mode == MODE_VERNIER_CALIBRATION) {
     MotorController_runVernierCalibration(controller);
     return;
   }
+#endif
 
   // Host-requested I2C bus recovery (FUNC_SYSTEM/SYSTEM_CMD_RECOVER_I2C). Performed here in the
   // foreground, not in the CAN ISR. Only while de-energized (DISABLED/IDLE/DAMPING) — masking TIM1
@@ -822,10 +836,13 @@ void MotorController_updateService(MotorController *controller) {
     return;
   }
 
+#if VERNIER_ENABLED
   // Debug/telemetry: keep encoder_secondary.position live while the motor is de-energized
   // (DISABLED/IDLE) so Level 1-2 bring-up can observe the secondary over CAN. Brief TIM1 mask
   // at the ~20 Hz updateService rate is harmless with the motor off; intentionally NOT done in
   // running modes (would blip the FOC loop -- that needs the Phase 2 async path).
+  // Compiled out in the single-encoder build: encoder_secondary is never initialized there
+  // (hi2c == NULL, cpr == 0), so reading it would NULL-deref / divide by zero.
   if (controller->mode == MODE_DISABLED || controller->mode == MODE_IDLE) {
     __HAL_TIM_DISABLE_IT(&htim1, TIM_IT_UPDATE);
     if (MotorController_drainI2C() == HAL_OK) {
@@ -833,6 +850,7 @@ void MotorController_updateService(MotorController *controller) {
     }
     __HAL_TIM_ENABLE_IT(&htim1, TIM_IT_UPDATE);
   }
+#endif
 }
 
 void MotorController_runCalibrationSequence(MotorController *controller) {

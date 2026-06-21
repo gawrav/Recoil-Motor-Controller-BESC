@@ -67,6 +67,18 @@
 #define ENCODER_PRECISION_BITS          12
 
 /** ======== Secondary AS5600L vernier encoder ======== **/
+// Master switch for the vernier (secondary encoder + boot-time absolute-position resolution).
+//   1 = absolute-position joint (the dual-encoder arm setup): the secondary AS5600L is read at
+//       boot, the vernier resolves absolute motor position, and the controller fails CLOSED
+//       (stays MODE_DISABLED) if it can't — required for an arm that could drive into a hard stop.
+//   0 = single-encoder (primary-only) build: the secondary device and all boot vernier resolution
+//       are compiled out, and the controller boots straight to MODE_IDLE with RELATIVE multi-turn
+//       position (n_rotations = 0 at power-up), exactly like the original pre-vernier firmware.
+//       Use for joints/wheels that don't need absolute position at boot (e.g. rover drive wheels).
+// The struct layout, PARAM offsets, and Flash format are identical either way (only runtime reads
+// are compiled out), so the same calibration Flash is compatible and primary diagnostics still run.
+#define VERNIER_ENABLED                 1
+
 // Encoder gear pair: 15-tooth on motor shaft drives 16-tooth on secondary shaft.
 // Secondary shaft rate = NUM/DEN of motor = 15/16. Pattern repeats every 16 motor revs.
 #define VERNIER_SECTORS                 16            // = larger tooth count (sectors before repeat)
