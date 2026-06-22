@@ -46,6 +46,55 @@ Two pieces:
 **Deferred (kept in this doc as future work, NOT implemented now): runtime sanity check.**
 The continuous drift-detection check (predict secondary from accumulated primary angle at ~10 Hz) is documented below but **not built in Phase 1**. If field experience shows we need live slip detection, it'll be added then — and at that point it must use the async single-in-flight read scheme (not blocking+mask) to avoid a torque blip while the motor runs. See "Deferred: runtime sanity check" section.
 
+## Build configuration: `VERNIER_ENABLED` (single-encoder vs dual-encoder)
+
+The whole vernier feature is gated behind one compile-time master switch in
+`motor_controller_conf.h`:
+
+```c
+#define VERNIER_ENABLED   1
+```
+
+- **`1` (default) — dual-encoder absolute-position joint.** The secondary AS5600L (`0x40`) is
+  read at boot, the vernier resolves absolute motor position, and the controller **fails closed**
+  (stays `MODE_DISABLED` with `ERROR_VERNIER_INCONSISTENT` / `ERROR_VERNIER_CALIBRATION_FAILED`)
+  if it cannot resolve or the unit is uncalibrated. Required for an arm that could otherwise drive
+  into a hard stop with the wrong absolute position. This is the configuration validated on the
+  bench and PCB (tags `breakout-verified`, `pcb-verified`).
+
+- **`0` — single-encoder (primary-only) build.** The secondary device and **all** boot-time vernier
+  resolution are compiled out; the controller boots straight to `MODE_IDLE` with **relative**
+  multi-turn position (`n_rotations = 0` at power-up), exactly like the original pre-vernier
+  firmware. Use for joints/wheels that don't need absolute position at boot (e.g. rover drive
+  wheels). The motor-control path (FOC, the 10 kHz primary streaming loop, all closed-loop modes)
+  is identical in both configs — only the boot-time absolute seed is removed.
+
+**Why a flag is needed (not just "leave the secondary unplugged"):** with `VERNIER_ENABLED = 1`
+and no secondary present, the fail-closed boot gate traps the controller in `MODE_DISABLED` — it
+never goes operational. The flag removes that gate (and every secondary read) so a single-encoder
+board reaches `MODE_IDLE`.
+
+What `= 0` compiles out (every secondary touch point, each `#if VERNIER_ENABLED`):
+the secondary `Encoder_init`; the secondary halves of `captureEncoderHealth` and
+`measureEncoderReadIntegrity`; the boot resolve-or-fail-closed gate (replaced by an unconditional
+`setMode(MODE_IDLE)`); the `MODE_VERNIER_CALIBRATION` dispatch; and the de-energized secondary
+telemetry read in `updateService` (which would otherwise NULL-deref / divide-by-zero on the
+never-initialized secondary, since `encoder_secondary.hi2c`/`.cpr` stay zero in `.bss`).
+
+**Invariants (verified):** struct layout, `PARAM_*` byte offsets, and the Flash format are
+**identical** in both configs — only runtime reads are compiled out, no struct fields are removed.
+So all `_Static_assert` offset pins still hold, the same calibration Flash is cross-compatible, the
+`= 1` path is byte-for-byte unchanged, and **primary-encoder diagnostics still run** in the `= 0`
+build (bus health, frame-error/start-fail counters, boot read-integrity for the primary). Both
+configs compile clean with `-Wall`.
+
+**Caveats for `= 0`:** the overtravel guard is gated on `vernier_initialized` (which stays `0`
+when the vernier is disabled), so a single-encoder build has **no overtravel protection** — matching
+pre-vernier relative-position behavior; rely on soft limits / hard stops as before. Sending
+`MODE_VERNIER_CALIBRATION` to a `= 0` build is inert (non-driving LED state, calibration never
+runs). The `= 0` path is compile-verified but, unlike `= 1`, not yet hardware-tested — validate on
+a single-encoder rig before deploying.
+
 ## Approach (Phase 1)
 
 - Keep the existing `Encoder` struct and driver — parameterize it on I2C address so it can serve both primary and secondary.
