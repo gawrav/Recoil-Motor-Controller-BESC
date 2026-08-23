@@ -31,6 +31,7 @@ import time
 from recoil_can import (
     RecoilCAN, Keepalive, MODES, MODE_NAMES, fmt_error, open_bus, as_f32,
     check_prerequisites as _shared_prereqs, read_watchdog_deadline, _deenergize,
+    safe_read,
     device_id_arg,
     DEFAULT_DEVICE_ID, DEFAULT_BITRATE,
 )
@@ -59,6 +60,36 @@ def host_position(dev, offset):
     return pm_raw - offset
 
 
+def _diagnose_stall(dev, tq_peak, iq_peak):
+    """Say WHICH clamp is binding on a failed settle, or that neither is.
+
+    Getting this right matters because the two prescriptions are opposite. torque_setpoint is
+    computed entirely inside PositionController_update and knows NOTHING about i_limit: when
+    current_limit is the real ceiling, the arm stalls, position error keeps growing, position_kp *
+    error keeps rising, and torque_setpoint pins at torque_limit anyway. So "tq_set == torque_limit"
+    alone does NOT mean the torque clamp is the constraint -- and telling the operator to raise
+    torque_limit there does nothing except arm a larger command that will lurch the arm the moment
+    the current limit is lifted.
+
+    i_q_setpoint is the disambiguator: it is post-clamp against i_limit, so it pins at
+    current_limit exactly when the current clamp is the binding one. clampf returns the bound
+    bit-for-bit and both sides are the same float32 round-tripped over SDO, so compare exactly --
+    no tolerance, which also avoids calling an idle motor 'saturated' when torque_limit is tiny.
+    """
+    tlim = safe_read(dev, "torque_limit")
+    ilim = safe_read(dev, "current_limit")
+    if tlim is None or ilim is None:
+        return "could not read the limits to diagnose the stall."
+    detail = f"peak tq_set={tq_peak:.4f}/{tlim:.4f} Nm, peak i_q_set={iq_peak:.4f}/{ilim:.4f} A"
+    # Current first: if both clamps are pinned, current is the effective ceiling.
+    if iq_peak >= ilim:
+        return (f"CURRENT_LIMIT is binding ({detail}) — raising torque_limit will NOT help. "
+                f"Raise current_limit, or check Kt / gear_ratio.")
+    if tq_peak >= tlim:
+        return (f"TORQUE_LIMIT is binding ({detail}) — raise torque_limit, not the gains.")
+    return (f"neither clamp is binding ({detail}) — look at the gains, the load, or the encoder.")
+
+
 def jog_repl(dev, offset, host_lo, host_hi, max_step, settle_tol):
     print("\n=== JOG (position mode) ===")
     print("  enter an ABSOLUTE host-frame target (e.g. 0.25), or a DELTA (+0.05 / -0.05)")
@@ -73,8 +104,17 @@ def jog_repl(dev, offset, host_lo, host_hi, max_step, settle_tol):
         if raw in ("q", "quit", "stop", "exit"):
             return
         if raw in ("s", "?", "status"):
+            # Re-read the position: `cur` was captured BEFORE the blocking input() and may be
+            # arbitrarily old (the operator can sit at this prompt for minutes while the arm sags
+            # or is backdriven). Printing it beside four freshly-read live fields would read as a
+            # coherent snapshot when it is not.
+            now = host_position(dev, offset)
             err = int(dev.read("error"))
-            print(f"  pos={cur:+.4f} rad (host)   mode=0x{int(dev.read('mode')):02X}   err={fmt_error(err)}")
+            # torque_setpoint IS in the command path here (MODE_POSITION feeds it to i_q via
+            # Kt/gear_ratio), so it is meaningful -- unlike in current/damping modes.
+            print(f"  pos={now:+.4f} rad (host)   mode=0x{int(dev.read('mode')):02X}   "
+                  f"tq_set={dev.read('torque_setpoint'):+.4f}/{dev.read('torque_limit'):.4f} Nm   "
+                  f"i_q={dev.read('i_q_measured'):+.4f} A   err={fmt_error(err)}")
             continue
 
         # Parse target: leading +/- => delta from current; bare number => absolute.
@@ -102,18 +142,28 @@ def jog_repl(dev, offset, host_lo, host_hi, max_step, settle_tol):
         print(f"  -> {kind}: commanding {target:+.4f} rad (host)")
         dev.set_position(target, 0.0)
 
-        # Watch it settle.
+        # Watch it settle, sampling BOTH clamps as we go. A single reading taken after the loop
+        # misses saturation that occurred during the move and has since relaxed, which is the
+        # common case for a move that overshoots its torque budget then creeps in.
+        tq_peak = 0.0
+        iq_peak = 0.0
         t0 = time.time()
         while time.time() - t0 < 2.0:
             time.sleep(0.05)
             now = host_position(dev, offset)
+            tq_s = safe_read(dev, "torque_setpoint")
+            iq_s = safe_read(dev, "i_q_setpoint")
+            if tq_s is not None:
+                tq_peak = max(tq_peak, abs(tq_s))
+            if iq_s is not None:
+                iq_peak = max(iq_peak, abs(iq_s))
             if abs(now - target) <= settle_tol:
                 print(f"     settled at {now:+.4f} rad (err {now - target:+.4f})")
                 break
         else:
             now = host_position(dev, offset)
-            print(f"     NOT settled after 2 s: at {now:+.4f} (err {now - target:+.4f}) — "
-                  f"check gains/limits/load.")
+            print(f"     NOT settled after 2 s: at {now:+.4f} (err {now - target:+.4f})")
+            print(f"     {_diagnose_stall(dev, tq_peak, iq_peak)}")
 
         if int(dev.read("error")) != 0:
             err = int(dev.read("error"))

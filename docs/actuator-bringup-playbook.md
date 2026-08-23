@@ -69,10 +69,10 @@ effect the moment the mode changes:
 
 | Mode | Consumes | Clamped by |
 |---|---|---|
-| `position` (0x13) | `position_target` via PDO2 | `position_limit_*`, then `torque_limit` |
-| `velocity` (0x12) | `velocity_target` (0x050) | `velocity_limit`, then `torque_limit` |
-| `torque` (0x11) | `torque_target` (0x044) | `torque_limit` |
-| `current` (0x10) | `i_q_target` (0x0B8) | `current_limit` only — bypasses the position controller |
+| `position` (0x13) | `position_target` via PDO2 | `position_limit_*`, then `torque_limit`, then `current_limit` |
+| `velocity` (0x12) | `velocity_target` (0x050) | `velocity_limit`, then `torque_limit`, then `current_limit` |
+| `torque` (0x11) | `torque_target` (0x044) | `torque_limit`, then `current_limit` |
+| `current` (0x10) | `i_q_target` (0x0B8), `i_d_target` (0x0BC) | `current_limit` **only** |
 
 This is not a soft warning. `position_target` and `torque_target` are **never** reset by
 `setMode` or `PositionController_reset`, and `position_setpoint` is recomputed from
@@ -96,12 +96,49 @@ The fallback is the overtravel guard, and it has two conditions that are easy to
 default). It also trips ~15° *past* the limit, into DAMPING. Both tools now refuse to energize
 without finite, ordered limits — see Step 6.
 
+### `torque` vs `current` mode
+
+Both end in the same 10 kHz FOC current loop; they differ only in how `i_q_target` gets
+populated, and what protections apply on the way.
+
+```
+MODE_TORQUE:   torque_target → EMA (torque_filter_alpha) → clamp ±torque_limit
+               = torque_setpoint → ÷Kt ÷gear_ratio → i_q_target,  i_d_target := 0
+
+MODE_CURRENT:  i_q_target / i_d_target written directly by the host
+```
+
+Both then hit `i_q_setpoint = clampf(i_q_target, ±i_limit)` in `CurrentController_update`.
+
+| | `torque` | `current` |
+|---|---|---|
+| Units | N·m at the **arm** (post-gearbox) | A, q-axis at the **motor** |
+| `torque_limit` | applies | **does not apply** |
+| `current_limit` | applies | applies — the only limit |
+| `torque_filter_alpha` EMA | applies (τ ≈ 3.2 ms at the default alpha) | none — steps instantly |
+| `i_d` | forced to 0 (pure quadrature) | yours to set |
+| Needs valid `Kt` / `gear_ratio` | yes | no |
+
+> ⚠️ **Current mode bypasses `torque_limit` entirely.** In torque mode the ceiling is
+> `min(torque_limit, current_limit × Kt × gear_ratio)`; in current mode it is just
+> `current_limit` (default 20 A). Use torque mode when you care about force at the joint;
+> reserve current mode for motor characterization (Kt verification, current-loop tuning, `i_d`
+> experiments).
+
+**Telemetry caveat:** `PositionController_update` runs unconditionally, and `MODE_CURRENT` falls
+into its `else` branch — so the firmware still computes `torque_setpoint` in current mode and then
+**discards** it (the torque→`i_q` conversion is gated on POSITION/VELOCITY/TORQUE). `run`
+therefore shows `i_q_set` (`i_q_setpoint`, 0x0C8 — the POST-clamp value, matching
+`torque_setpoint`'s semantics) instead of `tq_set` in current mode; do not read `torque_setpoint`
+over SDO there and believe it. The same applies to DAMPING, which is where a fault lands you.
+
 ### IDLE is freewheel, not brake
 
 `MODE_IDLE` de-energizes the powerstage completely. For a gravity-loaded arm that means it
 **falls**. `MODE_DAMPING` short-brakes (0,0,0 PWM). The tools pass through DAMPING before IDLE
-when leaving a mode that may have the arm moving, but the end state is still IDLE — support the
-arm before the run ends.
+when leaving **any** driving mode — including torque and current, where a constant torque command
+means constant acceleration, so the arm is moving fastest exactly when the run ends. The final
+state is still IDLE, so support the arm before the run finishes.
 
 ---
 
@@ -307,7 +344,12 @@ python3 recoil_jog.py --device-id 14 --max-step 0.05
 ```
 
 At the prompt: a bare number is an **absolute** host-frame target, `+0.02` / `-0.02` is a
-**delta**, `s` prints status, `q` or Ctrl-C e-stops to IDLE.
+**delta**, `s` prints status (position, mode, `tq_set`/`torque_limit`, `i_q`, error), `q` or
+Ctrl-C e-stops (→ DAMPING → IDLE, verified by readback).
+
+If a move reports **NOT settled**, check the `tq_set/torque_limit` pair it prints: saturated means
+the torque clamp is the binding constraint and you should raise `torque_limit`, not the gains.
+The tool says so explicitly when it detects saturation.
 
 ### Velocity / torque / current — use `run`
 
@@ -322,7 +364,7 @@ python3 recoil_can.py --device-id 14 run velocity --target 0.5 --duration 3
 # torque: N·m at the arm, clamped to torque_limit
 python3 recoil_can.py --device-id 14 run torque --target 0.2 --duration 3
 
-# current: A on the q-axis, clamped to current_limit; bypasses the position controller
+# current: A on the q-axis, clamped to current_limit ONLY — torque_limit does not apply
 python3 recoil_can.py --device-id 14 run current --target 1.0 --duration 2
 
 # position: host-frame rad; defaults to holding the current position if --target is omitted
@@ -404,11 +446,23 @@ enough to hold a heartbeat.
 ### Interpreting it
 
 - `tq_set` in the telemetry (`torque_setpoint`, 0x04C) should saturate at your `torque_limit`.
-  That is the clamp working.
-- If it saturates **below** `torque_limit`, you hit `current_limit` instead. Confirm by comparing
-  `i_q` against `current_limit`.
+  That is the torque clamp working. (Shown only for position/velocity/torque — in any other mode,
+  including DAMPING after a fault, `run` shows `i_q_set` instead, because `torque_setpoint` is
+  computed and discarded there.)
+- **`tq_set` pinned at `torque_limit` does not prove the torque clamp is the binding one.**
+  `torque_setpoint` is computed entirely inside `PositionController_update` and knows nothing
+  about `i_limit`. If `current_limit` is the real ceiling, the arm stalls, position error keeps
+  growing, `position_kp × error` keeps rising, and `tq_set` pins at `torque_limit` anyway. Raising
+  `torque_limit` then changes nothing — and arms a larger command that will lurch the arm the
+  moment you do lift the current limit.
+- **The disambiguator is `i_q_setpoint` (0x0C8), not `i_q_measured`.** It is post-clamp against
+  `i_limit`, so it pins at `current_limit` exactly when the current clamp is binding. `clampf`
+  returns the bound bit-for-bit, so compare exactly. `recoil_jog` does this automatically and
+  names the binding clamp on a failed settle.
 - `torque_filter_alpha` (0x070) applies an EMA **before** the clamp, so `tq_set` ramps rather than
-  stepping. Give it a beat before believing the first sample.
+  stepping. At the default 0.145364 and 2 kHz that is τ ≈ 3.2 ms (the "50 Hz cutoff" in
+  `position_controller.c`) — a few tens of ms to settle. It is a runtime param; 1.0 disables
+  filtering.
 - Watch `err` on every line. `OVER_CURRENT` (0x0100) means you exceeded the hardware protection,
   which is a separate and lower-level ceiling than either software limit.
 
@@ -442,6 +496,7 @@ When the firmware changes, re-check this playbook against:
 | `Mode` / `ErrorCode` enums | `MODES` / `ERROR_BITS`, and the mode tables above |
 | `SAFETY_WATCHDOG_ENABLED`, TIM2 config, or which frames reset it | the watchdog section and `Keepalive` |
 | Which modes clamp `position_limit_*` | "Only position mode enforces the position limits" |
+| The mode dispatch in `MotorController_update` (which modes convert torque→`i_q`) | "`torque` vs `current` mode", and `run`'s telemetry column choice |
 | `POSITION_OVERTRAVEL_MARGIN`, `VERNIER_SECTORS`, `VERNIER_SECTOR_BIAS` | Steps 5–8 |
 | `VERNIER_SECONDARY_SIGN` or the DIR wiring | **Re-run Steps 2, 4 and 5 in full** |
 | `VERNIER_ENABLED = 0` | Steps 2, 4, 5 do not apply; the board boots to IDLE with relative position |

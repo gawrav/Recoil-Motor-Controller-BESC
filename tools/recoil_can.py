@@ -133,9 +133,16 @@ PARAMS = {
     "position_measured":    (0x060, "f32"),   # raw arm position (absolute, NO offset applied)
     "torque_filter_alpha":  (0x070, "f32"),
     "current_limit":        (0x074, "f32"),   # current_controller.i_limit
-    "i_q_target":           (0x0B8, "f32"),   # MODE_CURRENT cmd (bypasses the position controller)
+    # MODE_CURRENT cmd. The position controller still RUNS in current mode (its else branch), but
+    # MotorController_update gates the torque->i_q conversion on POSITION||VELOCITY||TORQUE, so its
+    # torque_setpoint output is discarded and i_q_target is whatever the host wrote.
+    "i_q_target":           (0x0B8, "f32"),   # PRE-clamp command
     "i_d_target":           (0x0BC, "f32"),
     "i_q_measured":         (0x0C0, "f32"),
+    # POST-clamp (clampf against i_limit in CurrentController_update). This is the true analogue
+    # of torque_setpoint: the value the current loop actually chases. Use it, not i_q_target, when
+    # you want to see a clamp take effect.
+    "i_q_setpoint":         (0x0C8, "f32"),
     "flux_offset":          (0x13C, "f32"),   # encoder.flux_offset (0 => not flux-calibrated)
     "undervoltage_threshold": (0x0F4, "f32"),
     "bus_voltage":          (0x100, "f32"),   # powerstage.bus_voltage_measured
@@ -654,7 +661,10 @@ def _deenergize(dev, mode_name, why=""):
     would otherwise abandon an energized motor with a traceback on screen.
     """
     try:
-        if mode_name in ("velocity", "position"):
+        # Every driving mode, not just the obviously-moving ones. Torque and current mode command
+        # a constant torque, i.e. constant acceleration — the arm is moving fastest exactly when
+        # the run ends, so going straight to IDLE freewheels it at speed.
+        if mode_name in ("position", "velocity", "torque", "current"):
             dev.set_mode("damping")
             time.sleep(0.2)
         dev.set_mode("idle")
@@ -801,16 +811,37 @@ def cmd_run(dev, args):
                       f"{MODE_NAMES.get(m, '?')}); aborting.")
                 return 1
 
+            # torque_setpoint is only in the command path for POSITION/VELOCITY/TORQUE. Every
+            # other mode -- MODE_CURRENT, and DAMPING, which is where a fault lands us -- takes
+            # PositionController_update's else branch, so the firmware still computes
+            # torque_setpoint and then DISCARDS it (MotorController_update gates the torque->i_q
+            # conversion on POSITION||VELOCITY||TORQUE). Showing it there is a live-looking number
+            # with no bearing on what drives the motor, so fall back to i_q_setpoint.
+            #
+            # i_q_setpoint, not i_q_target: the former is POST-clamp against i_limit, matching
+            # torque_setpoint's post-clamp semantics, so "the column pins at the limit" means the
+            # same thing in both branches. i_q_target would just echo what we wrote.
+            TORQUE_PATH_MODES = (MODES["position"], MODES["velocity"], MODES["torque"])
+            if MODES[mode_name] not in TORQUE_PATH_MODES:
+                print("  (i_q_set is the post-clamp q-axis current setpoint; torque_setpoint is "
+                      "not in the command path in this mode)")
+
             t0 = time.time()
             while (time.time() - t0) < args.duration:
                 e = int(dev.read("error"))
                 m = int(dev.read("mode"))
+                # Keyed off the mode we just READ, not the one we asked for: once the controller
+                # faults to DAMPING, torque_setpoint stops driving anything, and that last line
+                # before the e-stop is exactly where a stale reading misleads most.
+                drive = (f"tq_set={dev.read('torque_setpoint'):+.4f}"
+                         if m in TORQUE_PATH_MODES
+                         else f"i_q_set={dev.read('i_q_setpoint'):+.4f}")
                 print(f"  t={time.time() - t0:5.1f}s "
                       f"mode=0x{m:02X} "
                       f"pos={dev.read('position_measured') - offset:+.4f} "
                       f"vel={dev.read('velocity_measured'):+.4f} "
-                      f"tq_set={dev.read('torque_setpoint'):+.4f} "
-                      f"i_q={dev.read('i_q_measured'):+.3f} "
+                      f"{drive} "
+                      f"i_q={dev.read('i_q_measured'):+.4f} "
                       f"err={fmt_error(e)}")
                 if e:
                     print("  ! controller raised an error — e-stopping.")

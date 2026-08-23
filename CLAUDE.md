@@ -144,6 +144,39 @@ Configuration stored at address `0x0801F800` (Bank 1, Page 63):
 
 Save/load via `MotorController_saveConfig()` / `MotorController_loadConfig()`.
 
+## Change Workflow (REQUIRED for all changes)
+
+This is motor-controller firmware and the host tools that energize it. A bug here can destroy
+hardware or injure someone. **Every** change follows this sequence — no exceptions for "small"
+or "obvious" ones:
+
+1. **Make the change.**
+2. **Verify it.** Build the firmware, or exercise the Python against the stub CAN harness. Never
+   report something as working on inspection alone.
+3. **Independent review by a subagent.** Launch a fresh subagent to review the diff
+   adversarially. Give it: the diff scope, what the change claims to do, and — critically — the
+   specific firmware files that are *ground truth* for the claims, so it verifies against source
+   rather than plausibility. Ask for confirmed-vs-speculative findings with severity, ranked.
+4. **Act on the findings.** Verify each one against the firmware yourself before acting — reviews
+   do produce false positives. Fix what is real; say plainly what was rejected and why.
+5. **Wait for explicit user confirmation before committing.** Present the change and the review
+   outcome, then stop. Do not commit until the user says to.
+
+Reviews on this repo have caught real safety bugs that inspection missed (a stale `position_target`
+lurching the arm on mode entry; a falsy-zero check that made the jog tool's prerequisite gate
+unpassable). Treat step 3 as load-bearing, not ceremony.
+
+### What a good review prompt names as ground truth
+
+- `Core/Inc/motor_controller_conf.h` — the `Parameter` enum is authoritative for every PARAM byte
+  offset. The SDO handler does raw pointer arithmetic into `MotorController`, so a stale offset
+  writes to the wrong field. Also `Mode`, `ErrorCode`, `FrameFunction`.
+- `Core/Src/motor_controller.c` — `handleCANMessage` / `handleSDO` / `handleNMT`, the mode
+  dispatch in `MotorController_update`, and the `_Static_assert` block pinning offsets.
+- `Core/Src/position_controller.c` + `.h` — which limits clamp in which mode, and the
+  host-vs-raw position frame (`position_offset`).
+- `Core/Src/app.c` and `main.c` — the TIM2 safety watchdog and which frames reset it.
+
 ## Development Workflow
 
 ### Modifying Hardware Configuration
