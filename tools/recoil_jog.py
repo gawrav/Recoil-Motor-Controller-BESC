@@ -29,91 +29,28 @@ import sys
 import time
 
 from recoil_can import (
-    RecoilCAN, MODES, MODE_NAMES, fmt_error, open_bus,
+    RecoilCAN, Keepalive, MODES, MODE_NAMES, fmt_error, open_bus, as_f32,
+    check_prerequisites as _shared_prereqs, read_watchdog_deadline, _deenergize,
+    device_id_arg,
     DEFAULT_DEVICE_ID, DEFAULT_BITRATE,
 )
-
-
-def _read(dev, name):
-    """Read a param, returning None on a bus timeout (so the prereq gate can report 'unreachable')."""
-    try:
-        return dev.read(name)
-    except Exception as e:  # TimeoutError or backend error
-        print(f"  ! failed to read {name}: {e}")
-        return None
 
 
 def check_prerequisites(dev):
     """Hard prerequisite gate. Returns (all_ok: bool, current_host_pos, offset).
 
-    Every check must pass before MODE_POSITION is allowed. Prints a PASS/FAIL checklist.
+    Delegates to recoil_can.check_prerequisites so this tool and `recoil_can.py run` cannot
+    diverge — a second, weaker gate is exactly how an uncalibrated or unlimited board ends up
+    energized.
     """
     print("Checking prerequisites for closed-loop position control:\n")
-    checks = []  # (label, ok, detail)
-
-    fw = _read(dev, "firmware_version")
-    if fw is None:
-        print("  [FAIL] device unreachable on the CAN bus — check id/wiring/termination/bitrate.")
-        return False, None, None
-    checks.append(("device reachable", True, f"firmware 0x{int(fw):08X}"))
-
-    err = int(_read(dev, "error") or 0xFFFFFFFF)
-    checks.append(("no latched error", err == 0, fmt_error(err)))
-
-    mode = int(_read(dev, "mode") or 0xFF)
-    checks.append(("mode == IDLE", mode == MODES["idle"],
-                   f"0x{mode:02X} ({MODE_NAMES.get(mode, '?')})"))
-
-    flux = _read(dev, "flux_offset")
-    checks.append(("flux (electrical) calibrated", flux is not None and abs(flux) > 1e-6,
-                   f"flux_offset={flux:+.5f} rad" if flux is not None else "n/a"))
-
-    uv = _read(dev, "undervoltage_threshold")
-    bus = _read(dev, "bus_voltage")
-    floor = max(6.0, uv if (uv is not None and math.isfinite(uv)) else 6.0)
-    checks.append(("motor bus voltage present", bus is not None and bus >= floor,
-                   f"{bus:.2f} V (>= {floor:.2f})" if bus is not None else "n/a"))
-
-    pkp = _read(dev, "position_kp")
-    checks.append(("position Kp nonzero", pkp is not None and pkp > 0.0,
-                   f"position_kp={pkp}" if pkp is not None else "n/a"))
-
-    vlim = _read(dev, "velocity_limit")
-    tlim = _read(dev, "torque_limit")
-    ilim = _read(dev, "current_limit")
-    checks.append(("velocity_limit > 0", vlim is not None and vlim > 0.0, f"{vlim}"))
-    checks.append(("torque_limit > 0",   tlim is not None and tlim > 0.0, f"{tlim}"))
-    checks.append(("current_limit > 0",  ilim is not None and ilim > 0.0, f"{ilim}"))
-
-    lo = _read(dev, "position_limit_lower")
-    hi = _read(dev, "position_limit_upper")
-    limits_ok = (lo is not None and hi is not None
-                 and math.isfinite(lo) and math.isfinite(hi) and lo < hi)
-    checks.append(("finite position limits", limits_ok,
-                   f"raw [{lo}, {hi}]" if (lo is not None and hi is not None) else "n/a"))
-
-    for label, ok, detail in checks:
-        print(f"  [{'PASS' if ok else 'FAIL'}] {label:30s} {detail}")
-
-    all_ok = all(ok for _, ok, _ in checks)
-
-    # Frame context for the operator (only meaningful once the basic reads succeeded).
-    offset = _read(dev, "position_offset")
-    pm_raw = _read(dev, "position_measured")
-    host_pos = None
-    if offset is not None and pm_raw is not None:
-        host_pos = pm_raw - offset
-        print(f"\n  current position: {host_pos:+.4f} rad (host frame)   "
-              f"[raw {pm_raw:+.4f}, offset {offset:+.4f}]")
-        if limits_ok:
-            print(f"  host travel range: [{lo - offset:+.4f}, {hi - offset:+.4f}] rad")
-
+    ok, info = _shared_prereqs(dev, mode="position")
     print()
-    if all_ok:
+    if ok:
         print("All prerequisites PASS.")
     else:
         print("PREREQUISITES NOT MET — position mode is blocked. Fix the FAIL items above and re-run.")
-    return all_ok, host_pos, offset
+    return ok, info.get("position_host"), info.get("offset")
 
 
 def host_position(dev, offset):
@@ -189,17 +126,20 @@ def main():
     p.add_argument("--interface", default="gs_usb")
     p.add_argument("--channel", default="0")
     p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE)
-    p.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID)
+    p.add_argument("--device-id", type=device_id_arg, default=DEFAULT_DEVICE_ID)
     p.add_argument("--max-step", type=float, default=0.05,
                    help="max per-command move in rad (host frame); default 0.05 (~3 deg at arm)")
     p.add_argument("--settle-tol", type=float, default=0.02,
                    help="position settle tolerance in rad; default 0.02")
+    p.add_argument("--heartbeat-period", type=float, default=0.2,
+                   help="watchdog feed period in s; must stay well under the firmware's 1 s")
     args = p.parse_args()
 
     bus = open_bus(args.interface, args.channel, args.bitrate)
     dev = RecoilCAN(bus, device_id=args.device_id)
 
     energized = False
+    keepalive = None
     try:
         ok, _, offset = check_prerequisites(dev)
         if not ok:
@@ -209,32 +149,69 @@ def main():
         hi = dev.read("position_limit_upper")
         host_lo, host_hi = lo - offset, hi - offset
 
+        # The board's deadline is NOT assumed to be 1 s — loadConfig restores watchdog_timeout
+        # from flash, and TIM2's autoreload is programmed from it.
+        deadline = read_watchdog_deadline(dev)
+        try:
+            keepalive = Keepalive(dev, period=args.heartbeat_period, deadline=deadline)
+        except ValueError as e:
+            print(f"REFUSING: {e}")
+            sys.exit(1)
+
+        # Clear the stale torque feed-forward before energizing: torque_target is added AFTER the
+        # position clamp (position_controller.c), so a leftover value from an earlier torque test
+        # pushes the arm straight off its soft limit. Never cleared by setMode.
+        dev.write("torque_target", 0.0)
+        if dev.read("torque_target") != 0.0:
+            print("REFUSING: could not clear stale torque_target.")
+            sys.exit(1)
+
+        # Stage the position target BEFORE energizing. position_target is never reset by setMode
+        # or PositionController_reset, and position_setpoint is recomputed from it every 2 kHz
+        # tick — so entering MODE_POSITION with a stale target (power-on 0.0 raw, or whatever a
+        # previous `setpos` left) makes the arm lurch toward it before the operator types
+        # anything. PDO2 is accepted in IDLE (no mode gate) so staging here is safe.
+        hold = host_position(dev, offset)
+        dev.set_position(hold, 0.0)
+        if dev.read("position_target") != as_f32(hold + offset):
+            print("REFUSING: could not stage the hold-here position target.")
+            sys.exit(1)
+        print(f"\n  staged hold-here target {hold:+.4f} rad (host) while still de-energized.")
+
         print("\n*** Switching to MODE_POSITION will ENERGIZE the motor and may MOVE the arm. ***")
         print(f"    Ensure the arm is clear and on a safe jig. Per-command step limit: {args.max_step:.4f} rad.")
+        if deadline is not None and abs(deadline - 1.0) > 1e-6:
+            print(f"    Board watchdog deadline is {deadline:.3f} s (not the 1 s default).")
         if input("    Type 'go' to enable position mode (anything else aborts): ").strip() != "go":
             print("Aborted — staying in IDLE.")
             sys.exit(0)
 
-        dev.set_mode("position")
-        energized = True
-        time.sleep(0.1)
-        m = int(dev.read("mode"))
-        if m != MODES["position"]:
-            print(f"  ! mode did not switch (now 0x{m:02X}); aborting.")
-            return
-        print("  position mode active.")
+        # The REPL blocks on input() indefinitely, and SDO polling does not feed the firmware's
+        # watchdog — without this the controller faults to DAMPING while the operator is still
+        # reading the prompt. Must wrap the whole energized region, not just the moves.
+        with keepalive:
+            dev.set_mode("position")
+            energized = True
+            time.sleep(0.1)
+            m = int(dev.read("mode"))
+            if m != MODES["position"]:
+                print(f"  ! mode did not switch (now 0x{m:02X}); aborting.")
+                return
+            print("  position mode active.")
 
-        jog_repl(dev, offset, host_lo, host_hi, args.max_step, args.settle_tol)
+            jog_repl(dev, offset, host_lo, host_hi, args.max_step, args.settle_tol)
 
     except KeyboardInterrupt:
         print("\n^C — e-stop.")
     finally:
         if energized:
-            try:
-                dev.set_mode("idle")
-                print("Returned to MODE_IDLE.")
-            except Exception as e:
-                print(f"!! FAILED to set IDLE on exit ({e}) — DISABLE THE MOTOR MANUALLY.")
+            # Shared with cmd_run: DAMPING to bleed motion, then IDLE, then zero every torque
+            # command, then READ BACK to confirm — set_mode is an unacked NMT, so printing
+            # "returned to IDLE" without verifying is a lie exactly when it matters most.
+            _deenergize(dev, "position")
+        if keepalive is not None and keepalive.errors:
+            print(f"  ! {keepalive.errors} heartbeat transmit failure(s) during the session — "
+                  f"the CAN link is unreliable.")
 
 
 if __name__ == "__main__":

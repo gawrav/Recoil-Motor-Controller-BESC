@@ -13,6 +13,13 @@ Protocol (from the firmware, see motor_controller.c / motor_controller_conf.h):
   - FLASH:           func=0xD,  data=[1]=store, [2]=load
   - PDO2 (pos/vel):  func=0x6,  data = [pos_target_f32, vel_target_f32]
                      -> reply func=0x5 = [pos_measured_f32, vel_measured_f32]
+  - HEARTBEAT:       func=0xE,  resets the safety watchdog (no reply)
+
+SAFETY WATCHDOG: in every mode except DISABLED / IDLE / CALIBRATION / VERNIER_CALIBRATION, the
+firmware faults to DAMPING + ERROR_WATCHDOG_TIMEOUT if no RPDO1/2/3 or HEARTBEAT frame arrives
+within 1 s. SDO reads and writes do NOT feed it. So a one-shot `mode torque` followed by process
+exit self-faults about a second later -- use the `run` subcommand (or the Keepalive class) to
+hold any driving mode.
 
 "Param offset" is the byte offset of the field inside the MotorController struct;
 the firmware reads/writes 32 bits at that offset directly.
@@ -36,6 +43,7 @@ import argparse
 import math
 import struct
 import sys
+import threading
 import time
 
 try:
@@ -99,6 +107,7 @@ ERROR_BITS = {
 PARAMS = {
     "device_id":            (0x000, "u32"),
     "firmware_version":     (0x004, "u32"),
+    "watchdog_timeout":     (0x008, "u32"),
     "mode":                 (0x010, "u32"),
     "error":                (0x014, "u32"),
     "gear_ratio":           (0x01C, "f32"),
@@ -112,9 +121,21 @@ PARAMS = {
     "position_limit_lower": (0x038, "f32"),   # RAW arm frame (NOT the host/zeroed frame)
     "position_limit_upper": (0x03C, "f32"),   # RAW arm frame
     "position_offset":      (0x040, "f32"),   # arm-frame zero (position_controller.position_offset)
+    # Mode setpoints + feedback. Each driving mode consumes a DIFFERENT target field; whatever
+    # value is already sitting there takes effect the instant you switch modes, so always write
+    # the target BEFORE the `mode` command.
+    "torque_target":        (0x044, "f32"),   # MODE_TORQUE cmd; feed-forward term in MODE_POSITION
+    "torque_measured":      (0x048, "f32"),
+    "torque_setpoint":      (0x04C, "f32"),   # post-EMA, post-clamp: what actually drives i_q
+    "velocity_target":      (0x050, "f32"),   # MODE_VELOCITY cmd (clamped to velocity_limit)
+    "velocity_measured":    (0x054, "f32"),
     "position_target":      (0x05C, "f32"),
     "position_measured":    (0x060, "f32"),   # raw arm position (absolute, NO offset applied)
+    "torque_filter_alpha":  (0x070, "f32"),
     "current_limit":        (0x074, "f32"),   # current_controller.i_limit
+    "i_q_target":           (0x0B8, "f32"),   # MODE_CURRENT cmd (bypasses the position controller)
+    "i_d_target":           (0x0BC, "f32"),
+    "i_q_measured":         (0x0C0, "f32"),
     "flux_offset":          (0x13C, "f32"),   # encoder.flux_offset (0 => not flux-calibrated)
     "undervoltage_threshold": (0x0F4, "f32"),
     "bus_voltage":          (0x100, "f32"),   # powerstage.bus_voltage_measured
@@ -207,6 +228,16 @@ def decode(value_bytes, kind):
     return struct.unpack("<I", value_bytes)[0]
 
 
+def as_f32(value):
+    """The exact value a float32 field will hold after the firmware stores it.
+
+    Readback checks must compare against this, not against the Python double: 12345.6 round-trips
+    to 12345.5996..., an error of ~4e-4 that a fixed 1e-6 tolerance would reject as a write
+    failure. Round-tripping makes the comparison exact at any magnitude.
+    """
+    return struct.unpack("<f", struct.pack("<f", float(value)))[0]
+
+
 def encode(value, kind):
     if kind == "f32":
         return struct.pack("<f", float(value))
@@ -219,14 +250,27 @@ class RecoilCAN:
     def __init__(self, bus, device_id=DEFAULT_DEVICE_ID):
         self.bus = bus
         self.device_id = device_id
+        # Serializes transmits only. A Keepalive thread sends heartbeats concurrently with the
+        # main thread's SDO traffic, and python-can backends are not guaranteed safe against two
+        # simultaneous send() calls. Deliberately NOT held across recv(): a heartbeat blocked
+        # behind a 0.5 s SDO timeout would eat half the 1 s watchdog budget. recv() needs no
+        # guard here because only one thread ever receives, and heartbeats draw no reply.
+        self._tx_lock = threading.Lock()
+
+    def _tx(self, msg):
+        with self._tx_lock:
+            self.bus.send(msg)
 
     def _send(self, func, data):
-        msg = can.Message(
+        self._tx(can.Message(
             arbitration_id=make_id(func, self.device_id),
             is_extended_id=False,
             data=bytes(data),
-        )
-        self.bus.send(msg)
+        ))
+
+    def heartbeat(self):
+        # FUNC_HEARTBEAT resets the firmware's TIM2 watchdog counter and nothing else.
+        self._send(FUNC_HEARTBEAT, [self.device_id & 0xFF])
 
     def set_mode(self, mode):
         if isinstance(mode, str):
@@ -247,7 +291,7 @@ class RecoilCAN:
         resp_id = make_id(FUNC_TRANSMIT_SDO, self.device_id)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            m = self.bus.recv(timeout=deadline - time.time())
+            m = self.bus.recv(timeout=max(0.0, deadline - time.time()))
             if m is not None and m.arbitration_id == resp_id and len(m.data) >= 4:
                 return bytes(m.data[:4])
         raise TimeoutError(f"no SDO reply for offset 0x{offset:03X}")
@@ -294,8 +338,8 @@ class RecoilCAN:
         while self.bus.recv(timeout=0.0) is not None:
             pass
         req = bytes([0x40, 0x00, 0x00, 0, 0, 0, 0, 0])  # read PARAM_DEVICE_ID (offset 0)
-        self.bus.send(can.Message(arbitration_id=make_id(FUNC_RECEIVE_SDO, 0),
-                                  is_extended_id=False, data=req))
+        self._tx(can.Message(arbitration_id=make_id(FUNC_RECEIVE_SDO, 0),
+                             is_extended_id=False, data=req))
         found = {}
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -305,6 +349,198 @@ class RecoilCAN:
             if (m.arbitration_id >> 7) == FUNC_TRANSMIT_SDO and len(m.data) >= 4:
                 found[m.arbitration_id & 0x7F] = struct.unpack("<I", bytes(m.data[:4]))[0]
         return found
+
+
+class Keepalive:
+    """Background heartbeat that feeds the firmware's safety watchdog.
+
+    With SAFETY_WATCHDOG_ENABLED, TIM2 (160 MHz / 16000 = 10 kHz, period 10000 = exactly 1 s)
+    faults the controller to MODE_DAMPING + ERROR_WATCHDOG_TIMEOUT if no watchdog-feeding frame
+    arrives within 1 s, in every mode EXCEPT DISABLED / IDLE / CALIBRATION / VERNIER_CALIBRATION
+    (app.c HAL_TIM_PeriodElapsedCallback).
+
+    Only RPDO1/2/3 and FUNC_HEARTBEAT reset that counter (motor_controller.c
+    handleCANMessage). SDO reads and writes do NOT -- so polling telemetry or sitting at an
+    operator prompt keeps the host busy while the controller silently times out. Any tool that
+    holds a driving mode must run one of these.
+
+    Use as a context manager:
+        with Keepalive(dev):
+            ...                       # driving mode is safe to hold here
+    """
+
+    MIN_PERIOD = 0.01          # below this we are just flooding a 1 Mbit bus
+    MAX_PERIOD = 0.5           # above this we are gambling against the deadline
+
+    def __init__(self, dev, period=0.2, deadline=None):
+        # A period of 0 or a negative makes Event.wait() return immediately, turning this into an
+        # unthrottled send loop that saturates the bus while the motor is driving. Reject it.
+        if not (self.MIN_PERIOD <= period <= self.MAX_PERIOD):
+            raise ValueError(f"heartbeat period {period} outside "
+                             f"[{self.MIN_PERIOD}, {self.MAX_PERIOD}] s")
+        # The deadline is NOT fixed at 1 s: MotorController_init programs TIM2 from
+        # controller->watchdog_timeout (ms), which is restored from flash. A board carrying
+        # watchdog_timeout = 100 would fault mid-move at the default 0.2 s period. Callers pass
+        # the value they read from the device; keep a 3x margin against poll jitter.
+        if deadline is not None and period > deadline / 3.0:
+            raise ValueError(f"heartbeat period {period:.3f} s is too slow for this board's "
+                             f"{deadline:.3f} s watchdog deadline (need <= {deadline / 3.0:.3f})")
+        self.dev = dev
+        self.period = period
+        self._stop = threading.Event()
+        self._thread = None
+        self.errors = 0            # transmit failures; a nonzero count means the link is sick
+
+    def __enter__(self):
+        # Feed once up front so the budget starts full even if the caller immediately blocks.
+        self.dev.heartbeat()
+        self._thread = threading.Thread(target=self._run, name="keepalive", daemon=True)
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        return False
+
+    def _run(self):
+        # Event.wait() returns True the moment stop is set, so shutdown is immediate rather than
+        # sleeping out the last period.
+        while not self._stop.wait(self.period):
+            try:
+                self.dev.heartbeat()
+            except Exception:
+                # Never let a transient transmit failure kill the thread: dropping the heartbeat
+                # entirely would fault the controller mid-move. Count it and keep trying.
+                #
+                # NB this counts LOCAL failures only. bus.send() returns once the frame is queued
+                # in the driver, so a frame that is never ACKed (ESC unplugged, broken wire) is
+                # retried by the CAN controller forever without raising here. errors > 0 proves
+                # the link is sick; errors == 0 does NOT prove it is healthy. The SDO replies in
+                # the caller's telemetry loop are the real liveness evidence.
+                self.errors += 1
+
+
+def safe_read(dev, name):
+    """Read a param, returning None on a bus timeout (so gates can report 'unreachable').
+
+    Callers MUST test `is None` rather than falsiness: the healthy values are themselves falsy
+    (error 0 = NO_ERROR, mode 0x00 = DISABLED), so `x or default` reports a clean controller as
+    faulted.
+    """
+    try:
+        return dev.read(name)
+    except Exception as e:  # TimeoutError or backend error
+        print(f"  ! failed to read {name}: {e}")
+        return None
+
+
+def check_prerequisites(dev, mode="position", verbose=True):
+    """Hard gate that every energizing path must pass. Returns (all_ok, info dict).
+
+    Shared by recoil_jog.py and `recoil_can.py run` on purpose: a second, weaker gate is how an
+    uncalibrated or unlimited board ends up energized. `mode` selects the mode-specific checks.
+    """
+    checks = []   # (label, ok, detail)
+    info = {}
+
+    fw = safe_read(dev, "firmware_version")
+    if fw is None:
+        if verbose:
+            print("  [FAIL] device unreachable on the CAN bus — check id/wiring/termination/bitrate.")
+        return False, info
+    checks.append(("device reachable", True, f"firmware 0x{int(fw):08X}"))
+
+    raw_err = safe_read(dev, "error")
+    err = 0xFFFFFFFF if raw_err is None else int(raw_err)
+    checks.append(("no latched error", raw_err is not None and err == 0, fmt_error(err)))
+
+    raw_mode = safe_read(dev, "mode")
+    cur_mode = 0xFF if raw_mode is None else int(raw_mode)
+    checks.append(("mode == IDLE", raw_mode is not None and cur_mode == MODES["idle"],
+                   f"0x{cur_mode:02X} ({MODE_NAMES.get(cur_mode, '?')})"
+                   + ("  (DISABLED usually means boot vernier resolution failed — see `status`)"
+                      if cur_mode == MODES["disabled"] else "")))
+
+    # flux_offset gates EVERY energizing mode. It feeds the commutation angle directly
+    # (motor_controller.c theta calculation); at 0 the board commutates at an arbitrary
+    # electrical offset. Torque/current modes have no outer loop to notice, so the commanded
+    # torque can come out wrong-signed or near-zero with large current draw.
+    flux = safe_read(dev, "flux_offset")
+    checks.append(("flux (electrical) calibrated", flux is not None and abs(flux) > 1e-6,
+                   f"flux_offset={flux:+.5f} rad" if flux is not None else "n/a"))
+
+    uv = safe_read(dev, "undervoltage_threshold")
+    bus_v = safe_read(dev, "bus_voltage")
+    floor = max(6.0, uv if (uv is not None and math.isfinite(uv)) else 6.0)
+    checks.append(("motor bus voltage present", bus_v is not None and bus_v >= floor,
+                   f"{bus_v:.2f} V (>= {floor:.2f})" if bus_v is not None else "n/a"))
+
+    vlim = safe_read(dev, "velocity_limit")
+    tlim = safe_read(dev, "torque_limit")
+    ilim = safe_read(dev, "current_limit")
+    for label, v in (("velocity_limit", vlim), ("torque_limit", tlim), ("current_limit", ilim)):
+        # Must be finite AND positive: clampf(x, -inf, inf) disables limiting entirely, and a
+        # negative limit inverts clampf into a constant full-scale output of the wrong sign.
+        checks.append((f"{label} finite and > 0",
+                       v is not None and math.isfinite(v) and v > 0.0, f"{v}"))
+
+    if mode == "position":
+        pkp = safe_read(dev, "position_kp")
+        checks.append(("position Kp nonzero", pkp is not None and pkp > 0.0,
+                       f"position_kp={pkp}" if pkp is not None else "n/a"))
+
+    lo = safe_read(dev, "position_limit_lower")
+    hi = safe_read(dev, "position_limit_upper")
+    limits_ok = (lo is not None and hi is not None
+                 and math.isfinite(lo) and math.isfinite(hi) and lo < hi)
+    # Finite limits are mandatory for position mode (they clamp the setpoint) and strongly wanted
+    # everywhere else: the overtravel guard is a no-op while they are +/-INFINITY, which is the
+    # firmware default. Without them, torque/velocity/current modes have NO position protection.
+    checks.append(("finite position limits", limits_ok,
+                   f"raw [{lo}, {hi}]" if (lo is not None and hi is not None) else "n/a"))
+
+    if verbose:
+        for label, ok, detail in checks:
+            print(f"  [{'PASS' if ok else 'FAIL'}] {label:30s} {detail}")
+
+    # Not a gate — both energizing callers clear this explicitly before switching mode, and
+    # blocking on something the tool then fixes itself just trains operators to ignore failures.
+    # Still worth surfacing: a stale torque_target is a live FEED-FORWARD added AFTER the position
+    # clamp (position_controller.c), so it pushes the arm off its soft limit in position mode and
+    # is the entire command in torque mode. Never cleared by setMode/PositionController_reset.
+    tq_t = safe_read(dev, "torque_target")
+    if verbose and tq_t is not None and abs(tq_t) > 1e-9:
+        print(f"  [WARN] stale torque_target = {tq_t:+.4f} Nm (feed-forward) — will be zeroed "
+              f"before energizing")
+
+    offset = safe_read(dev, "position_offset")
+    pm_raw = safe_read(dev, "position_measured")
+    info.update(offset=offset, position_raw=pm_raw, limit_lo=lo, limit_hi=hi,
+                limits_ok=limits_ok, torque_limit=tlim, current_limit=ilim)
+    if offset is not None and pm_raw is not None:
+        info["position_host"] = pm_raw - offset
+        if verbose:
+            print(f"\n  current position: {pm_raw - offset:+.4f} rad (host frame)   "
+                  f"[raw {pm_raw:+.4f}, offset {offset:+.4f}]")
+            if limits_ok:
+                print(f"  host travel range: [{lo - offset:+.4f}, {hi - offset:+.4f}] rad")
+
+    return all(ok for _, ok, _ in checks), info
+
+
+def read_watchdog_deadline(dev):
+    """Seconds the firmware allows between watchdog-feeding frames, or None if unreadable.
+
+    TIM2's autoreload is programmed once in MotorController_init from controller->watchdog_timeout
+    (ms), which loadConfig restores from flash — so it is NOT reliably 1 s. Note that writing this
+    param over SDO has no runtime effect; it needs flash-store + reboot.
+    """
+    v = safe_read(dev, "watchdog_timeout")
+    if v is None or int(v) <= 0:
+        return None
+    return int(v) / 1000.0
 
 
 def fmt_error(err):
@@ -397,6 +633,221 @@ def cmd_monitor(dev, period):
         print("\nstopped.")
 
 
+# Driving mode -> the parameter that mode consumes as its setpoint. MODE_POSITION is absent
+# because position targets go over PDO2 (host frame; firmware adds position_offset), not SDO.
+RUN_TARGET_PARAM = {
+    "velocity": "velocity_target",
+    "torque":   "torque_target",
+    "current":  "i_q_target",
+}
+
+
+def _deenergize(dev, mode_name, why=""):
+    """Return the controller to a safe state and VERIFY it, never trusting the unacked NMT.
+
+    Ordering matters. For a mode that leaves the arm moving we pass through DAMPING (short-brake:
+    MotorController_update drives 0,0,0 PWM) to bleed speed before IDLE, because IDLE fully
+    de-energizes the powerstage and a gravity-loaded arm FREEWHEELS. Then the setpoint is zeroed
+    so a later mode switch cannot re-apply this run's command.
+
+    Wrapped against BaseException, not Exception: a second Ctrl-C landing inside this function
+    would otherwise abandon an energized motor with a traceback on screen.
+    """
+    try:
+        if mode_name in ("velocity", "position"):
+            dev.set_mode("damping")
+            time.sleep(0.2)
+        dev.set_mode("idle")
+        # Zero every field that can command or bias torque. torque_target is included even for
+        # position mode, where it is a feed-forward term added AFTER the position clamp.
+        for pname in ("torque_target", "velocity_target", "i_q_target", "i_d_target"):
+            dev.write(pname, 0.0)
+        time.sleep(0.05)
+        m = safe_read(dev, "mode")
+        if m is None:
+            print("!! COULD NOT CONFIRM IDLE (no reply) — VERIFY THE MOTOR IS DE-ENERGIZED.")
+        elif int(m) != MODES["idle"]:
+            print(f"!! CONTROLLER IS NOT IDLE (0x{int(m):02X} {MODE_NAMES.get(int(m), '?')}) "
+                  f"— DISABLE THE MOTOR MANUALLY.")
+        else:
+            print(f"Returned to MODE_IDLE (setpoints zeroed).{why}")
+            print("    NOTE: IDLE de-energizes completely — the joint freewheels. Support the arm.")
+    except BaseException as e:
+        print(f"!! FAILED to de-energize ({e!r}) — DISABLE THE MOTOR MANUALLY.")
+
+
+def cmd_run(dev, args):
+    """Hold a driving mode for a bounded time with the watchdog fed, streaming telemetry.
+
+    This exists because every other path into a driving mode is unsafe from a one-shot CLI:
+    `mode torque` returns immediately, the process exits, no heartbeat follows, and ~1 s later
+    the firmware faults to DAMPING with ERROR_WATCHDOG_TIMEOUT. Anything that holds a mode has
+    to stay resident and keep feeding TIM2.
+    """
+    mode_name = args.mode
+
+    if not (math.isfinite(args.duration) and 0 < args.duration <= 300):
+        print(f"REFUSING: --duration {args.duration} must be finite and in (0, 300] s.")
+        return 1
+    if not (0.02 <= args.period <= 5.0):
+        print(f"REFUSING: --period {args.period} must be in [0.02, 5.0] s.")
+        return 1
+
+    # ---- shared prerequisite gate (same one recoil_jog uses; `run` must not be the weak door) ----
+    print(f"Checking prerequisites for {mode_name} mode:\n")
+    ok, info = check_prerequisites(dev, mode=mode_name)
+    if not ok:
+        print("\nPREREQUISITES NOT MET — refusing to energize. Fix the FAIL items above.")
+        return 1
+    print("\nAll prerequisites PASS.")
+    offset = info["offset"]
+
+    # ---- watchdog deadline: NOT assumed to be 1 s (loadConfig restores it from flash) ----
+    deadline = read_watchdog_deadline(dev)
+    try:
+        keepalive = Keepalive(dev, period=args.heartbeat_period, deadline=deadline)
+    except ValueError as e:
+        print(f"REFUSING: {e}")
+        return 1
+
+    # ---- optional limit overrides, applied and verified BEFORE energizing ----
+    for pname, val in (("torque_limit", args.torque_limit), ("current_limit", args.current_limit)):
+        if val is None:
+            continue
+        # clampf(x, -inf, inf) disables limiting outright; a NEGATIVE limit inverts clampf into a
+        # constant full-scale output of the wrong sign (clampf(x, +1, -1) returns -1 for all
+        # x > -1). Both are worse than no override at all.
+        if not (math.isfinite(val) and val > 0.0):
+            print(f"REFUSING: --{pname.replace('_', '-')} {val} must be finite and > 0.")
+            return 1
+        dev.write(pname, val)
+        got = dev.read(pname)            # SDO writes are unacked; never trust one without a read
+        if got != as_f32(val):
+            print(f"REFUSING: {pname} readback {got} != requested {val}")
+            return 1
+        print(f"  {pname} = {got}")
+
+    # ---- clear any stale torque feed-forward BEFORE energizing ----
+    # Never cleared by setMode or PositionController_reset, and added after the position clamp,
+    # so a leftover value pushes the arm off its soft limit the instant the mode changes.
+    dev.write("torque_target", 0.0)
+    if dev.read("torque_target") != 0.0:
+        print("REFUSING: could not clear stale torque_target.")
+        return 1
+
+    # ---- stage the setpoint BEFORE the mode switch ----
+    # position_target is likewise never reset, and position_setpoint is recomputed from it on
+    # every 2 kHz tick — so entering MODE_POSITION with a stale target makes the arm lurch toward
+    # it before we could possibly send the real one. PDO2 is accepted in IDLE (no mode gate in
+    # handleCANMessage) and feeds the watchdog, so we can stage it safely while de-energized.
+    if mode_name == "position":
+        lo, hi = info["limit_lo"], info["limit_hi"]
+        host_lo, host_hi = lo - offset, hi - offset
+        target = args.target if args.target is not None else info["position_host"]
+        if not (math.isfinite(target) and host_lo <= target <= host_hi):
+            print(f"REFUSING: target {target:+.4f} outside host range "
+                  f"[{host_lo:+.4f}, {host_hi:+.4f}] rad.")
+            return 1
+        dev.set_position(target, 0.0)
+        got_raw = dev.read("position_target")
+        if got_raw != as_f32(target + offset):
+            print(f"REFUSING: position_target readback {got_raw} != "
+                  f"expected raw {target + offset}")
+            return 1
+        print(f"  position target {target:+.4f} rad (host) = {got_raw:+.4f} raw; "
+              f"range [{host_lo:+.4f}, {host_hi:+.4f}]")
+    else:
+        if args.target is None:
+            print(f"REFUSING: {mode_name} mode needs --target.")
+            return 1
+        target = args.target
+        if not math.isfinite(target):
+            print(f"REFUSING: --target {target} must be finite.")
+            return 1
+        pname = RUN_TARGET_PARAM[mode_name]
+        dev.write(pname, target)
+        got = dev.read(pname)
+        if got != as_f32(target):
+            print(f"REFUSING: {pname} readback {got} != requested {target}")
+            return 1
+        print(f"  {pname} = {got}")
+
+    # ---- operator confirmation ----
+    print(f"\n*** MODE_{mode_name.upper()} ENERGIZES THE MOTOR AND MAY MOVE THE ARM. ***")
+    if mode_name != "position":
+        # position is the ONLY mode whose setpoint is clamped to position_limit_*; the velocity,
+        # torque and current branches of PositionController_update never consult them. Velocity
+        # is the most exposed of the three -- it commands continuous motion by definition.
+        print("    NOTE: this mode does NOT enforce position_limit_*. Only MODE_POSITION does.")
+        print(f"    Fallback is the overtravel guard, which trips ~15 deg PAST the limit "
+              f"(raw [{info['limit_lo']}, {info['limit_hi']}]) and only into DAMPING.")
+    if deadline is not None and abs(deadline - 1.0) > 1e-6:
+        print(f"    Board watchdog deadline is {deadline:.3f} s (not the 1 s default).")
+    print(f"    Duration {args.duration:.1f} s, then automatic return to IDLE. Ctrl-C = e-stop.")
+    if not args.yes and input("    Type 'go' to proceed (anything else aborts): ").strip() != "go":
+        print("Aborted — staying in IDLE.")
+        return 0
+
+    energized = False
+    rc = 0
+    try:
+        with keepalive as ka:
+            dev.set_mode(mode_name)
+            energized = True
+            time.sleep(0.1)
+            m = int(dev.read("mode"))
+            if m != MODES[mode_name]:
+                print(f"  ! mode did not switch (now 0x{m:02X} "
+                      f"{MODE_NAMES.get(m, '?')}); aborting.")
+                return 1
+
+            t0 = time.time()
+            while (time.time() - t0) < args.duration:
+                e = int(dev.read("error"))
+                m = int(dev.read("mode"))
+                print(f"  t={time.time() - t0:5.1f}s "
+                      f"mode=0x{m:02X} "
+                      f"pos={dev.read('position_measured') - offset:+.4f} "
+                      f"vel={dev.read('velocity_measured'):+.4f} "
+                      f"tq_set={dev.read('torque_setpoint'):+.4f} "
+                      f"i_q={dev.read('i_q_measured'):+.3f} "
+                      f"err={fmt_error(e)}")
+                if e:
+                    print("  ! controller raised an error — e-stopping.")
+                    rc = 1
+                    break
+                if m != MODES[mode_name]:
+                    print(f"  ! controller left {mode_name} mode on its own — e-stopping.")
+                    rc = 1
+                    break
+                time.sleep(args.period)
+    except KeyboardInterrupt:
+        print("\n^C — e-stop.")
+        rc = 1
+    finally:
+        if energized:
+            _deenergize(dev, mode_name)
+        # Reported after de-energizing, and outside the `with`, so it is seen on every exit path
+        # (early return, error abort, Ctrl-C) rather than only on a clean run.
+        if keepalive.errors:
+            print(f"  ! {keepalive.errors} heartbeat transmit failure(s) during the run — "
+                  f"the CAN link is unreliable; treat the result as suspect.")
+    return rc
+
+
+def device_id_arg(s):
+    """Valid device ids are 1..63 (motor_controller_conf.h: CAN ID range).
+
+    Unchecked, make_id() masks to 0x7F, so --device-id 128 silently becomes 0 = BROADCAST, and
+    the firmware accepts broadcast frames on EVERY node (`if (device_id && device_id != ...)`).
+    An NMT or `run` issued that way would command every controller on the bus at once.
+    """
+    v = int(s, 0)
+    if not (1 <= v <= 63):
+        raise argparse.ArgumentTypeError(f"device id {v} out of range 1..63")
+    return v
+
+
 def open_bus(interface, channel, bitrate):
     """Open a python-can bus, handling the gs_usb backend's index-based addressing.
 
@@ -419,7 +870,7 @@ def main():
     p.add_argument("--channel", default="0",
                    help="gs_usb: scan index (0=first); slcan: /dev/tty.usbmodemXXXX")
     p.add_argument("--bitrate", type=int, default=DEFAULT_BITRATE)
-    p.add_argument("--device-id", type=int, default=DEFAULT_DEVICE_ID)
+    p.add_argument("--device-id", type=device_id_arg, default=DEFAULT_DEVICE_ID)
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("status", help="dump key params once")
@@ -447,6 +898,21 @@ def main():
     ppos = sub.add_parser("setpos", help="send a position target (PDO2)")
     ppos.add_argument("position", type=float)
     ppos.add_argument("--vel", type=float, default=0.0)
+
+    prun = sub.add_parser("run", help="ENERGIZE: hold a driving mode with the watchdog fed")
+    prun.add_argument("mode", choices=["position", "velocity", "torque", "current"])
+    prun.add_argument("--target", type=float, default=None,
+                      help="setpoint: rad (host frame) / rad_s / Nm / A depending on mode. "
+                           "Required except for position, which defaults to holding here.")
+    prun.add_argument("--duration", type=float, default=3.0, help="seconds to hold (default 3)")
+    prun.add_argument("--period", type=float, default=0.25, help="telemetry poll period")
+    prun.add_argument("--heartbeat-period", type=float, default=0.2,
+                      help="watchdog feed period; must stay well under the firmware's 1 s")
+    prun.add_argument("--torque-limit", type=float, default=None,
+                      help="set position_controller.torque_limit before energizing (not flashed)")
+    prun.add_argument("--current-limit", type=float, default=None,
+                      help="set current_controller.i_limit before energizing (not flashed)")
+    prun.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
 
     args = p.parse_args()
 
@@ -497,9 +963,12 @@ def main():
         elif args.cmd == "setpos":
             dev.set_position(args.position, args.vel)
             print(f"position_target = {args.position} (vel ff {args.vel})")
+        elif args.cmd == "run":
+            return cmd_run(dev, args)
     finally:
         bus.shutdown()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
