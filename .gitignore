@@ -2,3 +2,7 @@
 *.elf
 *.list
 *.map
+
+# Python tooling
+__pycache__/
+*.py[cod]

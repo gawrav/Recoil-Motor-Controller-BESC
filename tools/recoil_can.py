@@ -102,9 +102,22 @@ PARAMS = {
     "mode":                 (0x010, "u32"),
     "error":                (0x014, "u32"),
     "gear_ratio":           (0x01C, "f32"),
+    # PID gains + limits (used by recoil_jog.py's prerequisite gate):
+    "position_kp":          (0x020, "f32"),
+    "position_ki":          (0x024, "f32"),
+    "velocity_kp":          (0x028, "f32"),
+    "velocity_ki":          (0x02C, "f32"),
+    "torque_limit":         (0x030, "f32"),
+    "velocity_limit":       (0x034, "f32"),
+    "position_limit_lower": (0x038, "f32"),   # RAW arm frame (NOT the host/zeroed frame)
+    "position_limit_upper": (0x03C, "f32"),   # RAW arm frame
     "position_offset":      (0x040, "f32"),   # arm-frame zero (position_controller.position_offset)
     "position_target":      (0x05C, "f32"),
     "position_measured":    (0x060, "f32"),   # raw arm position (absolute, NO offset applied)
+    "current_limit":        (0x074, "f32"),   # current_controller.i_limit
+    "flux_offset":          (0x13C, "f32"),   # encoder.flux_offset (0 => not flux-calibrated)
+    "undervoltage_threshold": (0x0F4, "f32"),
+    "bus_voltage":          (0x100, "f32"),   # powerstage.bus_voltage_measured
     "encoder_n_rotations":  (0x130, "i32"),
     "encoder_position":     (0x134, "f32"),
     "encoder2_position":    (0x360, "f32"),
