@@ -159,12 +159,54 @@ or "obvious" ones:
    rather than plausibility. Ask for confirmed-vs-speculative findings with severity, ranked.
 4. **Act on the findings.** Verify each one against the firmware yourself before acting — reviews
    do produce false positives. Fix what is real; say plainly what was rejected and why.
-5. **Wait for explicit user confirmation before committing.** Present the change and the review
-   outcome, then stop. Do not commit until the user says to.
+5. **Repeat 3–4 until a round comes back clean.** One round is not enough — see below.
+6. **Report, then wait for explicit user confirmation before committing.** Stop and hand the user
+   a summary. Do not commit until they say to.
 
-Reviews on this repo have caught real safety bugs that inspection missed (a stale `position_target`
-lurching the arm on mode entry; a falsy-zero check that made the jog tool's prerequisite gate
-unpassable). Treat step 3 as load-bearing, not ceremony.
+### What the summary must contain
+
+Not a narrative — two explicit lists, so the user can audit the judgement calls without reading
+the diff:
+
+- **Fixed**: every finding acted on. Severity, what was wrong, and what the fix was. Say which
+  round found it, and flag any finding that was a defect in an *earlier fix* rather than in the
+  original work — that pattern is the reason the loop exists.
+- **Dropped**: every finding NOT acted on, each with the reason. "Rejected — verified against
+  `<file>`, the claim is wrong because X", or "accepted as a known limitation because Y". Silently
+  omitting a finding is not allowed: the user cannot audit what they cannot see, and a finding
+  dropped without a reason is indistinguishable from one that was missed.
+
+Also state how many rounds ran and which round came back clean. If anything was verified
+empirically (a measurement, a reproduction, a stub test), give the number — "max heartbeat gap
+1.6 s → 0.22 s" carries the argument in a way "fixed the starvation" does not.
+
+### Review until clean — not once
+
+Every round reviews the code *as it now stands*, including the fixes the previous round prompted.
+This is not belt-and-braces; fixes have repeatedly introduced worse bugs than the ones they
+addressed. Real examples from this repo:
+
+- Round 1 flagged a thread-safety concern that was waved off as having no concrete path. It was
+  the concrete path: dropped CAN frames silently stalled the arm mid-jog.
+- The fix for that (`can.ThreadSafeBus`) was a **no-op** — it holds separate send and recv locks.
+- Its replacement (one lock over both) introduced a **hang-forever** in libusb, unkillable by
+  Ctrl-C with the motor energized, plus the very heartbeat starvation it was written to prevent.
+- A readback check added to catch lost commands would have told the operator a **moving** arm was
+  dead, on ~30% of jogs, because of a float32 double-rounding mismatch with the MCU.
+
+None of those were visible by inspection. Each was caught only because another round ran.
+
+**Clean means:** the round produced no confirmed finding of medium severity or above that is
+neither fixed nor consciously accepted with a stated reason. Low-severity nits you decide not to
+act on do not block; say so explicitly rather than silently dropping them.
+
+**Each round's prompt must say which round it is and what the previous rounds found**, so the
+reviewer targets what changed instead of re-treading settled ground. Explicitly tell it that a
+clean result is a valid outcome and it must not invent findings to appear thorough — otherwise
+the loop never terminates.
+
+If two consecutive rounds produce only findings you are rejecting, stop and put the disagreement
+to the user rather than iterating further.
 
 ### What a good review prompt names as ground truth
 

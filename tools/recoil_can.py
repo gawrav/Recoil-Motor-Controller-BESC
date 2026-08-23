@@ -261,16 +261,90 @@ class RecoilCAN:
     def __init__(self, bus, device_id=DEFAULT_DEVICE_ID):
         self.bus = bus
         self.device_id = device_id
-        # Serializes transmits only. A Keepalive thread sends heartbeats concurrently with the
-        # main thread's SDO traffic, and python-can backends are not guaranteed safe against two
-        # simultaneous send() calls. Deliberately NOT held across recv(): a heartbeat blocked
-        # behind a 0.5 s SDO timeout would eat half the 1 s watchdog budget. recv() needs no
-        # guard here because only one thread ever receives, and heartbeats draw no reply.
-        self._tx_lock = threading.Lock()
+        # ONE lock covering send AND recv. python-can Bus objects are not thread-safe, and the
+        # gs_usb backend drives a single libusb handle -- a Keepalive send colliding with the main
+        # thread's recv is what silently dropped PDO2 targets and heartbeats on this rig (the arm
+        # sat still with torque_setpoint at 0, and the watchdog eventually tripped, while
+        # bus.send() raised nothing).
+        #
+        # An earlier attempt used can.ThreadSafeBus; that does NOT fix this. It takes separate
+        # `_lock_send` and `_lock_recv` locks and explicitly documents that it assumes send() and
+        # _recv_internal() may run simultaneously. Send-vs-recv is precisely our collision.
+        self._io_lock = threading.RLock()
+        # Heartbeat state, shared with Keepalive. Emitting is the job of whoever holds the lock
+        # (see _hb_if_due_locked) rather than of one thread that must win a lock race.
+        self._hb_period = None      # None = no heartbeats wanted
+        self._hb_last = 0.0
+        self.hb_errors = 0          # heartbeat transmit failures, wherever they were emitted from
+
+
+    def _hb_msg(self):
+        return can.Message(arbitration_id=make_id(FUNC_HEARTBEAT, self.device_id),
+                           is_extended_id=False, data=bytes([self.device_id & 0xFF]))
+
+    def _hb_if_due_locked(self):
+        """Emit a heartbeat if one is due. Caller MUST hold _io_lock.
+
+        This is what actually keeps the watchdog fed. A dedicated thread cannot be relied on:
+        CPython locks are not FIFO, so a main thread looping through recv slices reacquires while
+        still on-CPU and starves the waiter -- measured heartbeat gaps over 1.5 s against a 1 s
+        deadline, i.e. the tool causing the very DAMPING fault it then reports. Making the lock
+        HOLDER responsible removes the dependence on lock fairness entirely.
+        """
+        if self._hb_period is None:
+            return
+        now = time.time()
+        if now - self._hb_last < self._hb_period:
+            return
+        # Advance the clock BEFORE attempting the send, and swallow failures. Letting an exception
+        # out would surface a heartbeat TRANSMIT fault as a failure of whatever parameter happened
+        # to be mid-read -- telling the operator the board is unreachable when only sending is
+        # broken -- and leaving _hb_last unadvanced would retry on every 1 ms poll, so one failure
+        # would darken the entire telemetry surface permanently. Count it instead; Keepalive.errors
+        # reports it, which is the only place it can still be attributed correctly.
+        self._hb_last = now
+        try:
+            self.bus.send(self._hb_msg())
+        except Exception:
+            self.hb_errors += 1
 
     def _tx(self, msg):
-        with self._tx_lock:
+        with self._io_lock:
             self.bus.send(msg)
+
+    def _rx(self, timeout):
+        """Locked, polled receive. Returns a Message or None once `timeout` elapses.
+
+        Always polls with `timeout=0.0`, never a real timeout, and the deadline is enforced HERE.
+
+        This is not a style choice. BusABC.recv is not a leaf: it loops on
+        `time_left = timeout - (time() - start)` guarded only by `time_left > 0` (can/bus.py), so
+        ANY positive timeout can re-slice down to a sub-millisecond remainder. gs_usb then computes
+        `timeout_ms = round(timeout * 1000) if timeout else 1`, and anything in (0, 0.0005) is
+        truthy but rounds to 0 -- which libusb reads as "block forever". That hangs the process
+        while holding _io_lock: heartbeats stop, the watchdog trips the motor to DAMPING, and the
+        main thread is stuck in C so Ctrl-C cannot even be delivered. Flooring what WE pass does
+        not help, because the re-slice happens below us.
+
+        `timeout=0.0` is provably immune: time_left is 0.0, which is falsy, so gs_usb uses 1 ms;
+        the next time_left is negative, so the loop returns after exactly one _recv_internal call.
+        One 1 ms poll, no re-slice possible.
+        """
+        deadline = time.time() + timeout
+        while True:
+            with self._io_lock:
+                self._hb_if_due_locked()
+                m = self.bus.recv(timeout=0.0)
+            if m is not None:
+                return m
+            if time.time() >= deadline:
+                return None
+            # Paces the poll AND yields the lock. sleep(0) yields the GIL but does not pace:
+            # gs_usb's recv(0.0) blocks ~1 ms internally, but socketcan (select, timeout 0.0) and
+            # pcan (time_left == 0.0) return immediately, so this loop burned 100% of a core --
+            # measured 1.6M recv() calls for a single 0.5 s read. 1 ms costs at most 1 ms of
+            # extra reply latency, which gs_usb already pays per poll.
+            time.sleep(0.001)
 
     def _send(self, func, data):
         self._tx(can.Message(
@@ -281,7 +355,9 @@ class RecoilCAN:
 
     def heartbeat(self):
         # FUNC_HEARTBEAT resets the firmware's TIM2 watchdog counter and nothing else.
-        self._send(FUNC_HEARTBEAT, [self.device_id & 0xFF])
+        with self._io_lock:
+            self.bus.send(self._hb_msg())
+            self._hb_last = time.time()
 
     def set_mode(self, mode):
         if isinstance(mode, str):
@@ -293,16 +369,33 @@ class RecoilCAN:
         payload = bytes([0x20, offset & 0xFF, (offset >> 8) & 0xFF, 0x00]) + encode(value, kind)
         self._send(FUNC_RECEIVE_SDO, payload)
 
+    # Cap the stale-frame drain. Unbounded, it never exits while the board is streaming --
+    # fast_frame_frequency defaults to 0 but is restored from flash and can drive TPDO4 at up to
+    # 10 kHz, which would produce frames faster than we retire them.
+    MAX_DRAIN = 256
+
+    def _drain(self):
+        """Discard buffered frames. True if the bus went quiet, False if the cap was hit."""
+        for _ in range(self.MAX_DRAIN):
+            if self._rx(0.0) is None:
+                return True
+        return False
+
     def sdo_read_raw(self, offset, timeout=0.5):
         # flush any stale frames
-        while self.bus.recv(timeout=0.0) is not None:
-            pass
+        # Refuse rather than answer from a queue we could not clear: sdo_read_raw accepts the
+        # first TRANSMIT_SDO it sees, so an undrained backlog can hand back a stale reply for a
+        # DIFFERENT parameter and it would look like a perfectly good reading.
+        if not self._drain():
+            raise IOError(f"bus is streaming faster than it can be drained "
+                          f"({self.MAX_DRAIN}+ frames queued); a stale reply could be mistaken "
+                          f"for this one. Check fast_frame_frequency (want 0).")
         req = bytes([0x40, offset & 0xFF, (offset >> 8) & 0xFF, 0, 0, 0, 0, 0])
         self._send(FUNC_RECEIVE_SDO, req)
         resp_id = make_id(FUNC_TRANSMIT_SDO, self.device_id)
         deadline = time.time() + timeout
         while time.time() < deadline:
-            m = self.bus.recv(timeout=max(0.0, deadline - time.time()))
+            m = self._rx(max(0.0, deadline - time.time()))
             if m is not None and m.arbitration_id == resp_id and len(m.data) >= 4:
                 return bytes(m.data[:4])
         raise TimeoutError(f"no SDO reply for offset 0x{offset:03X}")
@@ -354,7 +447,18 @@ class RecoilCAN:
         # vernier base_sector) — only shifts where "zero" lands. Persisted to flash.
         # Returns (raw_before, offset_written).
         pm = self.read("position_measured")     # 0x060: raw absolute arm angle (no offset)
+        # Finiteness + readback BEFORE flashing. This is the only write in either tool that
+        # persists without verifying, and it bypasses the CLI `write` gate (which lives in the
+        # write subcommand, not here). position_measured is Encoder_getPosition()/gear_ratio, so
+        # a zero gear_ratio yields +/-inf and a NaN offset persisted to flash makes loadConfig
+        # return HAL_ERROR on the NEXT BOOT -- a bricked start from a bad zero.
+        if not math.isfinite(pm):
+            raise ValueError(f"position_measured is {pm}; refusing to persist a non-finite "
+                             f"position_offset (check gear_ratio and the encoder).")
         self.write("position_offset", pm)        # getter returns position_measured - offset -> 0 here
+        got = self.read("position_offset")
+        if got != as_f32(pm):
+            raise IOError(f"position_offset readback {got!r} != {as_f32(pm)!r}; not flashing.")
         self.flash_store()
         return pm
 
@@ -375,15 +479,16 @@ class RecoilCAN:
         Returns {device_id: device_id_value}.  Empty -> physical-layer problem
         (termination / bitrate / wiring), not an ID mismatch.
         """
-        while self.bus.recv(timeout=0.0) is not None:
-            pass
+        if not self._drain():
+            print("  ! bus is streaming heavily; discovery may be unreliable "
+                  "(check fast_frame_frequency)")
         req = bytes([0x40, 0x00, 0x00, 0, 0, 0, 0, 0])  # read PARAM_DEVICE_ID (offset 0)
         self._tx(can.Message(arbitration_id=make_id(FUNC_RECEIVE_SDO, 0),
                              is_extended_id=False, data=req))
         found = {}
         deadline = time.time() + timeout
         while time.time() < deadline:
-            m = self.bus.recv(timeout=max(0.0, deadline - time.time()))
+            m = self._rx(max(0.0, deadline - time.time()))
             if m is None:
                 continue
             if (m.arbitration_id >> 7) == FUNC_TRANSMIT_SDO and len(m.data) >= 4:
@@ -429,28 +534,62 @@ class Keepalive:
         self.period = period
         self._stop = threading.Event()
         self._thread = None
-        self.errors = 0            # transmit failures; a nonzero count means the link is sick
+        self._errors_at_start = 0
+
+    @property
+    def errors(self):
+        """Heartbeat transmit failures during THIS session, wherever they were emitted from.
+
+        Must read the device counter, not a local one: with in-band emission the main thread sends
+        essentially every heartbeat during read-heavy work, so a counter incremented only by this
+        thread would sit at 0 no matter how broken the link was.
+        """
+        return self.dev.hb_errors - self._errors_at_start
 
     def __enter__(self):
+        self._errors_at_start = self.dev.hb_errors
+        # Arm the in-band emitter first: from here on, ANY thread holding _io_lock will send a
+        # heartbeat when one is due, so liveness does not depend on this thread winning a lock
+        # race against a busy main thread.
         # Feed once up front so the budget starts full even if the caller immediately blocks.
-        self.dev.heartbeat()
-        self._thread = threading.Thread(target=self._run, name="keepalive", daemon=True)
-        self._thread.start()
+        # Non-fatal: the prerequisite gate has already completed a dozen SDO round trips by now,
+        # so one failed send is far more likely transient than a dead link, and crashing here
+        # with a raw backend traceback is worse than counting it and letting the in-band emitter
+        # retry. A genuinely dead link still aborts the run via the telemetry reads.
+        try:
+            self.dev.heartbeat()
+        except Exception:
+            self.dev.hb_errors += 1
+        self.dev._hb_period = self.period
+        try:
+            self._thread = threading.Thread(target=self._run, name="keepalive", daemon=True)
+            self._thread.start()
+        except BaseException:
+            # Python does not call __exit__ when __enter__ raises, so never leave the emitter
+            # armed on a context that was not actually entered: a later plain `read` would
+            # silently feed the watchdog with no keepalive the operator knows about.
+            self.dev._hb_period = None
+            raise
         return self
 
     def __exit__(self, *exc):
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
+        self.dev._hb_period = None
         return False
 
     def _run(self):
+        # Polls at half the period and sends only when due, so it never double-sends alongside
+        # the in-band emitter in _rx. Its real job is the idle case -- the main thread parked on
+        # input() at the jog prompt, holding no lock and issuing no traffic.
         # Event.wait() returns True the moment stop is set, so shutdown is immediate rather than
         # sleeping out the last period.
-        while not self._stop.wait(self.period):
+        while not self._stop.wait(self.period / 2.0):
             try:
-                self.dev.heartbeat()
-            except Exception:
+                with self.dev._io_lock:
+                    self.dev._hb_if_due_locked()   # counts its own failures on dev.hb_errors
+            except Exception:   # pragma: no cover - _hb_if_due_locked already swallows send errors
                 # Never let a transient transmit failure kill the thread: dropping the heartbeat
                 # entirely would fault the controller mid-move. Count it and keep trying.
                 #
@@ -459,7 +598,7 @@ class Keepalive:
                 # retried by the CAN controller forever without raising here. errors > 0 proves
                 # the link is sick; errors == 0 does NOT prove it is healthy. The SDO replies in
                 # the caller's telemetry loop are the real liveness evidence.
-                self.errors += 1
+                self.dev.hb_errors += 1
 
 
 def safe_read(dev, name):
@@ -744,6 +883,11 @@ def cmd_run(dev, args):
         return 1
     print("\nAll prerequisites PASS.")
     offset = info["offset"]
+    if offset is None or not math.isfinite(offset):
+        print(f"REFUSING: position_offset is "
+              f"{'unreadable' if offset is None else f'not finite ({offset})'} — every host/raw "
+              f"frame conversion depends on it.")
+        return 1
 
     # ---- watchdog deadline: NOT assumed to be 1 s (loadConfig restores it from flash) ----
     deadline = read_watchdog_deadline(dev)
@@ -793,9 +937,11 @@ def cmd_run(dev, args):
             return 1
         dev.set_position(target, 0.0)
         got_raw = dev.read("position_target")
-        if got_raw != as_f32(target + offset):
-            print(f"REFUSING: position_target readback {got_raw} != "
-                  f"expected raw {target + offset}")
+        # f32-exact, matching the MCU: f32 on the wire, then a single-precision add. A
+        # double-precision expectation here false-refuses on ~1 startup in 3.
+        if got_raw != as_f32(as_f32(target) + offset):
+            print(f"REFUSING: position_target readback {got_raw:.9g} != "
+                  f"expected raw {as_f32(as_f32(target) + offset):.9g}")
             return 1
         print(f"  position target {target:+.4f} rad (host) = {got_raw:+.4f} raw; "
               f"range [{host_lo:+.4f}, {host_hi:+.4f}]")
@@ -917,6 +1063,14 @@ def open_bus(interface, channel, bitrate):
 
     gs_usb (candleLight) has no /dev node — the device is selected by scan index,
     and the bitrate is programmed onto the dongle here.
+
+    Thread safety is handled by RecoilCAN._io_lock, NOT here.
+
+    Do NOT "fix" this by switching to can.ThreadSafeBus. It does not do what the name suggests
+    for this program: it holds two SEPARATE locks (`_lock_send` and `_lock_recv`, see
+    can/thread_safe_bus.py) and its own docstring states it "assumes that both send() and
+    _recv_internal() of the underlying bus instance can be called simultaneously". Send-vs-recv
+    is exactly the collision that drops frames here, so ThreadSafeBus is a no-op against it.
     """
     if interface == "gs_usb":
         idx = int(channel) if str(channel).isdigit() else 0
@@ -952,7 +1106,12 @@ def main():
 
     pw = sub.add_parser("write", help="write one param by name")
     pw.add_argument("name", choices=list(PARAMS.keys()))
-    pw.add_argument("value")
+    # argparse's negative-number matcher is ^-\d+$|^-\d*\.\d+$, so "-1.5" is fine as a
+    # positional but "-inf" is parsed as an option flag. That would make the one legitimate
+    # infinity -- restoring position_limit_lower to its firmware default -- unreachable, so say
+    # how to get it through.
+    pw.add_argument("value", help="numeric value. For a leading-dash non-numeric literal use a "
+                                  "'--' separator, e.g.: write position_limit_lower -- -inf")
 
     sub.add_parser("flash-store", help="persist config to flash")
     sub.add_parser("flash-load", help="reload config from flash")
@@ -1005,6 +1164,27 @@ def main():
         elif args.cmd == "write":
             _, kind = PARAMS[args.name]
             val = float(args.value) if kind == "f32" else int(args.value, 0)
+            # `write` reaches any f32 field directly and handleSDO stores the raw 32 bits with no
+            # validation, so this is the last door NaN/inf can walk through -- and the verifier
+            # would have printed "(verified)" for it, the tool blessing exactly what jog, setpos
+            # and run all refuse. No parameter in the map has a legitimate NaN value.
+            # +/-inf is refused too, EXCEPT for the position limits, whose firmware default
+            # genuinely is +/-INFINITY (position_controller.c init) and which an operator may
+            # legitimately want to restore.
+            # (One field does use NaN meaningfully: vernier_phase_offset NaN is the firmware's
+            # "uncalibrated" sentinel. Refusing it here is still correct -- that field is owned by
+            # MODE_VERNIER_CALIBRATION, and `write vernier_cal_magic 0` invalidates a calibration
+            # cleanly without hand-poking a float the resolver reads every boot.)
+            INF_OK = ("position_limit_lower", "position_limit_upper")
+            if kind == "f32" and math.isnan(val):
+                print(f"REFUSING: NaN is never a valid value for {args.name}. It survives every "
+                      f"firmware clamp and sticks in the integrator and torque filter.")
+                return 1
+            if kind == "f32" and math.isinf(val) and args.name not in INF_OK:
+                print(f"REFUSING: {val} for {args.name}. Infinities disable the clamps that use "
+                      f"them (clampf(x, -inf, inf) returns x unchanged). Only "
+                      f"{' and '.join(INF_OK)} may legitimately be infinite.")
+                return 1
             # Guard the one param that can take the bus down. TIM8's autoreload is
             # (10000/f)-1 at 10 kHz, so f approaching 10000 from below is the danger band:
             # f=1000 -> 1 kHz TPDO4, f=5000 -> 5 kHz, f=10000 -> 10 kHz, which saturates a
@@ -1017,7 +1197,11 @@ def main():
                       f"{10000 / max(1, 10000 // int(val)):.0f} Hz and can saturate the bus. "
                       f"Use 0 (off) to 500.")
                 return 1
-            dev.write(args.name, val)
+            try:
+                dev.write(args.name, val)
+            except (OverflowError, struct.error) as e:
+                print(f"REFUSING: {args.value} is out of range for a {kind} field ({e}).")
+                return 1
             # Verify in THIS process. SDO writes are unacked, so an unverified write is a guess --
             # and the read-back doubles as the round-trip that keeps the dongle healthy (see
             # RecoilCAN.settle). Expected value comes from the encode/decode round-trip so f32
@@ -1030,12 +1214,24 @@ def main():
             if args.name == "device_id":
                 dev.device_id = int(expect)
             got = dev.read(args.name)
-            if got == expect or (isinstance(got, float) and math.isnan(got)
-                                 and math.isnan(expect)):
+            if got == expect:
                 print(f"wrote {args.name} = {got} (verified)")
+                if args.name in INF_OK and math.isinf(val):
+                    # Per-side: motor_controller.c evaluates
+                    #   (isfinite(lo) && pos < lo-margin) || (isfinite(hi) && pos > hi+margin)
+                    # so an infinite limit disables only ITS side of the guard, not the whole
+                    # thing. check_prerequisites separately needs both finite and lo < hi.
+                    side = "lower" if args.name.endswith("lower") else "upper"
+                    print(f"  NOTE: this disables the {side} side of the overtravel guard, and "
+                          f"jog/run will refuse to energize until BOTH limits are finite.")
                 if args.name == "device_id":
                     print(f"  device is now id {int(expect)}; pass --device-id {int(expect)} "
                           f"from here (flash-store to persist).")
+            elif isinstance(got, float) and math.isnan(got):
+                print(f"{args.name} reads NaN after the write — the field is poisoned. NaN "
+                      f"survives every clamp; land a finite value here before using any driving "
+                      f"mode.")
+                return 1
             elif args.name == "error":
                 # The write landed; the fault re-latched before the ~1 ms read-back. Firmware
                 # re-raises ERROR_ENCODER_FAULT within ~1 ms on a persistently bad encoder, and
@@ -1067,8 +1263,64 @@ def main():
             dev.flash_load()
             print("FLASH load sent")
         elif args.cmd == "setpos":
+            # cmd_run gates both of its setpoints on isfinite; setpos did not. NaN passes every
+            # firmware clamp (clampf returns it unchanged) and sticks in position_integrator and
+            # the torque EMA until a mode change.
+            if not (math.isfinite(args.position) and math.isfinite(args.vel)):
+                print(f"REFUSING: setpos needs finite values (got position={args.position}, "
+                      f"vel={args.vel}). A non-finite target poisons the firmware's position "
+                      f"integrator until the next mode change.")
+                return 1
             dev.set_position(args.position, args.vel)
-            print(f"position_target = {args.position} (vel ff {args.vel})")
+            # Verify, and print the RAW value the board actually holds rather than echoing the
+            # host-frame number as if it were stored state. Expectation mirrors the MCU exactly:
+            # f32 on the wire, then a single-precision add of position_offset.
+            off = safe_read(dev, "position_offset")
+            got = safe_read(dev, "position_target")
+            got_v = safe_read(dev, "velocity_target")
+            want = as_f32(as_f32(args.position) + off) if off is not None else None
+            want_v = as_f32(args.vel)
+            if want is not None and got == want and got_v == want_v:
+                print(f"position_target: {args.position:.9g} rad (host) -> {got:.9g} rad (raw); "
+                      f"velocity_target: {got_v:.9g} — verified")
+                if args.vel != 0.0:
+                    print("  NOTE: velocity_target is a feed-forward in MODE_POSITION but is the "
+                          "COMMAND in MODE_VELOCITY. setpos has no mode gate.")
+            elif got is None or off is None or got_v is None:
+                print(f"position_target: sent {args.position:.9g} rad (host), "
+                      f"velocity_target {args.vel:.9g} — COULD NOT VERIFY (no SDO reply)")
+                # Distinct nonzero: a scripted caller must be able to tell "sent and confirmed"
+                # from "sent, outcome unknown", and must not treat the latter as success.
+                return 2
+            else:
+                # Name the field that actually mismatched: the gate checks both, so reporting
+                # only the position printed two identical numbers when it was velocity that
+                # failed. "Did not land" is the likely reading but not the only one -- another
+                # session (a running recoil_jog) may have commanded something in between.
+                if (got is not None and math.isnan(got)) or \
+                   (got_v is not None and math.isnan(got_v)):
+                    if off is not None and math.isnan(off):
+                        print("position_offset is NaN, so EVERY command converts to NaN. Fix "
+                              "that field first (`write position_offset <finite>`); nothing "
+                              "else will work until you do.")
+                        return 1
+                    print(f"BOARD IS HOLDING NaN (position_target={got}, "
+                          f"velocity_target={got_v}) — its position integrator and torque filter "
+                          f"are poisoned.")
+                    print("  A mode change clears the integrator and the torque filter, but NOT "
+                          "position_target (PositionController_reset does not touch it), so "
+                          "re-entering the mode re-poisons instantly. Land a FINITE target "
+                          "first — retry setpos, or use jog/`run position`, which stage one — "
+                          "and then change mode.")
+                    return 1
+                bad = []
+                if got != want:
+                    bad.append(f"position_target reads {got:.9g}, expected {want:.9g} (raw)")
+                if got_v != want_v:
+                    bad.append(f"velocity_target reads {got_v:.9g}, expected {want_v:.9g}")
+                print("; ".join(bad) + " — the command did not land, or another session "
+                      "moved the target.")
+                return 1
         elif args.cmd == "run":
             return cmd_run(dev, args)
     finally:
