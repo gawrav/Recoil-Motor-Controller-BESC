@@ -108,6 +108,10 @@ PARAMS = {
     "device_id":            (0x000, "u32"),
     "firmware_version":     (0x004, "u32"),
     "watchdog_timeout":     (0x008, "u32"),
+    # Nonzero => TIM8 transmits a TPDO4 telemetry frame at this rate (app.c
+    # HAL_TIM_PeriodElapsedCallback). Every SDO write reprograms TIM8's autoreload from it, so a
+    # large value turns any write into a bus flood. Default 0; restored from flash by loadConfig.
+    "fast_frame_frequency": (0x00C, "u32"),
     "mode":                 (0x010, "u32"),
     "error":                (0x014, "u32"),
     "gear_ratio":           (0x01C, "f32"),
@@ -310,6 +314,35 @@ class RecoilCAN:
     def write(self, name, value):
         offset, kind = PARAMS[name]
         self.sdo_write(offset, value, kind)
+
+    def settle(self, timeout=0.3):
+        """Force a completed round-trip before the bus is torn down. Best-effort; never raises.
+
+        Fire-and-forget commands -- SDO write, NMT, FLASH, SYSTEM -- draw no reply, so
+        `dev.write(...)` returns as soon as the frame is queued and the process can call
+        bus.shutdown() microseconds later, while the gs_usb URB is still in flight. Observed
+        symptom: the dongle is left in a state where later opens transmit but never receive, and
+        only physically replugging it clears the condition. A read-back is proof the USB pipe was
+        serviced in BOTH directions, which a blind sleep is not.
+
+        Failure is not an error: the command the user asked for has already been sent, and a
+        device that cannot answer (wrong id, `discover` against an unknown board) must not turn a
+        successful command into a failed one. Fall back to a short sleep so the URB still lands.
+        """
+        # Let any already-queued frame leave first. A settle read is FUNC_RECEIVE_SDO (0xC ->
+        # arb id 0x60E on dev 14), which is NUMERICALLY LOWER and therefore HIGHER CAN priority
+        # than FLASH (0xD -> 0x68E) or SYSTEM (0xF -> 0x78E). If the dongle's controller orders
+        # its TX mailboxes by identifier rather than FIFO, the settle read would win arbitration
+        # and could be transmitted BEFORE a pending flash-store -- which we would then tear down
+        # unsent, silently, after printing "FLASH store sent". A few ms is longer than the ~130 us
+        # a frame needs and costs nothing.
+        time.sleep(0.005)
+        try:
+            self.sdo_read_raw(PARAMS["device_id"][0], timeout=timeout)
+            return True
+        except Exception:
+            time.sleep(0.1)
+            return False
 
     def recover_i2c(self):
         # Request I2C bus recovery; firmware performs it in the foreground (~1 cycle later).
@@ -972,8 +1005,50 @@ def main():
         elif args.cmd == "write":
             _, kind = PARAMS[args.name]
             val = float(args.value) if kind == "f32" else int(args.value, 0)
+            # Guard the one param that can take the bus down. TIM8's autoreload is
+            # (10000/f)-1 at 10 kHz, so f approaching 10000 from below is the danger band:
+            # f=1000 -> 1 kHz TPDO4, f=5000 -> 5 kHz, f=10000 -> 10 kHz, which saturates a
+            # 1 Mbit bus. (Above 10000 the integer division underflows to a 16-bit ARR of
+            # 0xFFFF = ~0.15 Hz, so very large values are inert rather than dangerous -- but
+            # nobody should be relying on that.) A flood starves the heartbeat and faults an
+            # energized joint to DAMPING mid-move, and survives a flash-store into the next boot.
+            if args.name == "fast_frame_frequency" and val > 500:
+                print(f"REFUSING: fast_frame_frequency {val} would transmit TPDO4 at up to "
+                      f"{10000 / max(1, 10000 // int(val)):.0f} Hz and can saturate the bus. "
+                      f"Use 0 (off) to 500.")
+                return 1
             dev.write(args.name, val)
-            print(f"wrote {args.name} = {val} (no ack; read back to confirm)")
+            # Verify in THIS process. SDO writes are unacked, so an unverified write is a guess --
+            # and the read-back doubles as the round-trip that keeps the dongle healthy (see
+            # RecoilCAN.settle). Expected value comes from the encode/decode round-trip so f32
+            # rounding and u32/i32 masking are handled exactly, at any magnitude.
+            expect = decode(encode(val, kind), kind)
+            # Writing device_id retargets the board the instant the frame lands: the firmware
+            # drops any later frame addressed to the OLD id. Without this the read-back below
+            # times out with "no SDO reply for offset 0x000" -- indistinguishable from the
+            # wedged-dongle failure this tooling exists to avoid, on a write that in fact worked.
+            if args.name == "device_id":
+                dev.device_id = int(expect)
+            got = dev.read(args.name)
+            if got == expect or (isinstance(got, float) and math.isnan(got)
+                                 and math.isnan(expect)):
+                print(f"wrote {args.name} = {got} (verified)")
+                if args.name == "device_id":
+                    print(f"  device is now id {int(expect)}; pass --device-id {int(expect)} "
+                          f"from here (flash-store to persist).")
+            elif args.name == "error":
+                # The write landed; the fault re-latched before the ~1 ms read-back. Firmware
+                # re-raises ERROR_ENCODER_FAULT within ~1 ms on a persistently bad encoder, and
+                # ERROR_WATCHDOG_TIMEOUT every 1 s while sitting in DAMPING. Saying "write
+                # failed" here would be the opposite of what happened, and a nonzero exit would
+                # break the scripted recovery step in the playbook.
+                print(f"cleared error, but it re-latched immediately: {fmt_error(int(got))}")
+                print("  The fault is LIVE, not stale — fix the cause; clearing it cannot help.")
+            else:
+                print(f"WRITE FAILED: {args.name} reads {got}, expected {expect}")
+                print("  If this is a field the control loop recomputes every tick (measured "
+                      "values, setpoints), it cannot be written -- that is expected.")
+                return 1
         elif args.cmd == "recover":
             dev.recover_i2c()
             print("I2C recovery requested; polling status...")
@@ -997,7 +1072,18 @@ def main():
         elif args.cmd == "run":
             return cmd_run(dev, args)
     finally:
-        bus.shutdown()
+        # Unconditional, not just on the fire-and-forget subcommands: it costs one ~1 ms round
+        # trip, and making it a property of "the process is about to close the bus" means a new
+        # subcommand cannot forget it and reintroduce the wedged-dongle bug.
+        #
+        # try/FINALLY, not try/except: settle() can block for up to ~0.4 s, and a KeyboardInterrupt
+        # is a BaseException that `except Exception` would not catch. A second Ctrl-C during an
+        # e-stop would otherwise skip bus.shutdown() entirely and leave the dongle exactly as
+        # wedged as the bug this settle() exists to prevent -- reachable precisely in an emergency.
+        try:
+            dev.settle()
+        finally:
+            bus.shutdown()
     return 0
 
 

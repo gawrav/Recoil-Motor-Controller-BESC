@@ -262,6 +262,15 @@ def main():
         if keepalive is not None and keepalive.errors:
             print(f"  ! {keepalive.errors} heartbeat transmit failure(s) during the session — "
                   f"the CAN link is unreliable.")
+        # This tool previously never closed the bus at all, leaving the gs_usb device started.
+        # settle() first so no queued transmit is still in flight when the device goes away --
+        # tearing the bus down mid-URB leaves the dongle receiving nothing until it is replugged.
+        # try/FINALLY so a second Ctrl-C during settle (a BaseException, up to ~0.4 s window)
+        # cannot skip the shutdown -- that window is reachable exactly during an e-stop.
+        try:
+            dev.settle()
+        finally:
+            bus.shutdown()
 
 
 if __name__ == "__main__":

@@ -56,11 +56,35 @@ Consequences:
 - Use the **`run` subcommand** (or `recoil_jog.py`), both of which run a `Keepalive` thread for
   the entire energized region.
 
-### SDO writes are not acknowledged
+### SDO writes are not acknowledged — the tools verify for you
 
-`MotorController_handleSDO` sends no reply for a write (`ccs == 1`). **Always read back after
-writing anything that matters.** The `run` subcommand does this automatically for the setpoint
-and limit overrides.
+`MotorController_handleSDO` sends no reply for a write (`ccs == 1`), so a write is a guess until
+something reads the field back. **The `write` subcommand now does that itself** and reports
+`(verified)` or `WRITE FAILED` with a nonzero exit; `run` does the same for its setpoints and
+limit overrides. You no longer need a separate `read` after a write.
+
+Two cases print something other than a plain `(verified)`:
+
+- **`write error 0`** on a board whose fault is still live. The write lands, then the firmware
+  re-raises the bit before the read-back — `ERROR_ENCODER_FAULT` within ~1 ms on a persistently
+  bad encoder, `ERROR_WATCHDOG_TIMEOUT` every 1 s while sitting in DAMPING. You get
+  `cleared error, but it re-latched immediately`, which means fix the cause; clearing cannot help.
+- **`write device_id N`** retargets the board immediately, so every later command needs
+  `--device-id N`. The tool says so, and `flash-store` to persist it.
+
+Fields the control loop recomputes every tick (`torque_setpoint`, `i_q_setpoint`, measured values)
+cannot be written and will correctly report `WRITE FAILED`.
+
+### Why the tools settle the bus before exiting
+
+SDO writes, NMT, FLASH and SYSTEM frames draw no reply, so a command could previously queue a
+frame and call `bus.shutdown()` microseconds later — while the gs_usb URB was still in flight.
+That leaves the dongle transmitting but never receiving, and **only physically replugging it
+clears the condition**. Symptom: a `read` right after a `write` fails with `no SDO reply for
+offset 0x...`.
+
+Both tools now force a completed round-trip before closing the bus. If you ever see that timeout
+again, it is a real link problem — check termination, wiring, and bitrate — not this.
 
 ### Stale setpoints apply instantly on mode switch
 
@@ -320,9 +344,10 @@ host range using `position_offset` from `status`:
 python3 recoil_can.py --device-id 14 write position_limit_lower <host_lo + offset>
 python3 recoil_can.py --device-id 14 write position_limit_upper <host_hi + offset>
 python3 recoil_can.py --device-id 14 flash-store
-python3 recoil_can.py --device-id 14 read position_limit_lower   # writes are unacked — read back
-python3 recoil_can.py --device-id 14 read position_limit_upper
 ```
+
+Each `write` verifies itself and prints `(verified)`; a nonzero exit means it did not stick, so
+these are safe to chain with `&&`.
 
 The overtravel guard trips at `POSITION_OVERTRAVEL_MARGIN` (~15° at the arm) **past** a limit and
 faults to DAMPING. It is inert while the limits are the default ±INFINITY, and it requires
@@ -477,7 +502,8 @@ enough to hold a heartbeat.
 | Encoder health | `recoil_can.py --device-id N diag` |
 | Watch encoders live | `recoil_can.py --device-id N monitor` |
 | Unwedge I²C | `recoil_can.py --device-id N recover` |
-| Clear a latched error | `recoil_can.py --device-id N write error 0` |
+| Clear a latched error | `recoil_can.py --device-id N write error 0` (says so if the fault is live) |
+| Check for a telemetry flood | `recoil_can.py --device-id N read fast_frame_frequency` (want 0) |
 | Flux calibration | `recoil_can.py --device-id N mode calibration` |
 | Vernier calibration | `recoil_can.py --device-id N mode vernier_calibration` |
 | Re-zero the host frame | `recoil_can.py --device-id N set-zero` |
@@ -500,6 +526,8 @@ When the firmware changes, re-check this playbook against:
 | `POSITION_OVERTRAVEL_MARGIN`, `VERNIER_SECTORS`, `VERNIER_SECTOR_BIAS` | Steps 5–8 |
 | `VERNIER_SECONDARY_SIGN` or the DIR wiring | **Re-run Steps 2, 4 and 5 in full** |
 | `VERNIER_ENABLED = 0` | Steps 2, 4, 5 do not apply; the board boots to IDLE with relative position |
+| `handleSDO` starting to acknowledge writes, or new fire-and-forget frame functions | "SDO writes are not acknowledged" and `RecoilCAN.settle` |
+| The TIM8 / `fast_frame_frequency` telemetry path | the `write` guard on `fast_frame_frequency` (currently capped at 500 Hz) |
 
 ## Related docs
 
